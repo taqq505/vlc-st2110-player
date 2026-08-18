@@ -15,6 +15,13 @@
 # endif
 # include <winsock2.h>
 # include <ws2tcpip.h>
+/* mingw-w64 provides struct pollfd/WSAPoll() via winsock2.h (given the
+ * _WIN32_WINNT bump above) but no plain poll(). VLC's own poll() shim
+ * lives in vlc_fixups.h, which is only wired in through VLC's internally
+ * generated config.h -- not available to an out-of-tree plugin build.
+ * Alias it directly; vlc_threads.h later redefines poll() to its own
+ * vlc_poll() wrapper for everything after that point, which is fine. */
+# define poll(fds, nfds, timeout) WSAPoll((void *)(fds), (nfds), (timeout))
 #else
 # include <sys/socket.h>
 # include <netinet/in.h>
