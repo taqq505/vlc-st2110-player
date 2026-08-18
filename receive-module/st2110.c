@@ -3,6 +3,23 @@
  * See docs/vlc-st2110_receive-module_仕様書.md for the full specification.
  */
 
+/* vlc_common.h pulls in vlc_threads.h, which uses poll()/struct pollfd.
+ * On MinGW those only come from winsock2.h, and only once _WIN32_WINNT
+ * requests Vista+ (WSAPoll). Must be set up before any vlc_*.h include. */
+#ifdef _WIN32
+# ifndef _WIN32_WINNT
+#  define _WIN32_WINNT 0x0601
+# endif
+# ifndef WINVER
+#  define WINVER 0x0601
+# endif
+# include <winsock2.h>
+# include <ws2tcpip.h>
+#else
+# include <sys/socket.h>
+# include <netinet/in.h>
+#endif
+
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 #include <vlc_demux.h>
@@ -16,13 +33,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef _WIN32
-# include <winsock2.h>
-#else
-# include <sys/socket.h>
-# include <netinet/in.h>
-#endif
 
 static int  Open(vlc_object_t *);
 static void Close(vlc_object_t *);
@@ -126,9 +136,12 @@ static void SetColorimetry(video_format_t *v, const char *colorimetry, const cha
         if (tcs && !strcmp(tcs, "PQ"))
             v->transfer = TRANSFER_FUNC_SMPTE_ST2084;
         else if (tcs && !strcmp(tcs, "HLG"))
-            v->transfer = TRANSFER_FUNC_ARIB_B67;
+            v->transfer = TRANSFER_FUNC_HLG;
         else
-            v->transfer = TRANSFER_FUNC_BT2020;
+            /* video_transfer_func_t has no dedicated BT2020 value in this
+             * VLC version; BT.2020 SDR's OETF is numerically the same as
+             * BT.709's, so that's the correct fallback, not a placeholder. */
+            v->transfer = TRANSFER_FUNC_BT709;
     }
     else
     {
@@ -136,7 +149,7 @@ static void SetColorimetry(video_format_t *v, const char *colorimetry, const cha
         v->space     = COLOR_SPACE_BT709;
         v->transfer  = TRANSFER_FUNC_BT709;
     }
-    v->color_range = COLOR_RANGE_LIMITED;
+    v->b_color_range_full = false; /* narrow/video range, per spec §5.8 */
 }
 
 /* RTP header (RFC 3550). Validates all offsets against the received length
