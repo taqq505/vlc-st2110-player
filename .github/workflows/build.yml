@@ -68,7 +68,7 @@ jobs:
         shell: msys2 {0}
         run: |
           cd receive-module
-          gcc -std=gnu99 -Wall -Wextra -shared -DPIC -D__PLUGIN__ -DMODULE_STRING='"st2110"' \
+          gcc -std=gnu99 -Wall -Wextra -shared -fPIC -DPIC -D__PLUGIN__ -DMODULE_STRING='"st2110"' \
               -I../vlc-src/include \
               -o libst2110_plugin.dll st2110.c \
               "/c/Program Files/VideoLAN/VLC/libvlccore.dll" -lws2_32

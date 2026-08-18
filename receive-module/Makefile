@@ -1,6 +1,6 @@
 PREFIX    = /usr
 CC        = cc
-CFLAGS    = -std=gnu99 -O2 -Wall -Wextra -DPIC $(shell pkg-config --cflags vlc-plugin)
+CFLAGS    = -std=gnu99 -O2 -Wall -Wextra -fPIC -DPIC $(shell pkg-config --cflags vlc-plugin)
 LIBS      = $(shell pkg-config --libs vlc-plugin)
 CPPFLAGS  = -D__PLUGIN__ -DMODULE_STRING=\"st2110\"
 plugindir = $(PREFIX)/lib/vlc/plugins/access
