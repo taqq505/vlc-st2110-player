@@ -72,9 +72,9 @@ vlc_module_end()
 typedef struct
 {
     uint16_t len;     /* octets of pixel data carried by this segment */
-    uint16_t line;    /* line number within the frame */
+    uint16_t line;    /* line number (per-field if interlaced, else per-frame) */
     uint16_t offset;  /* pixel offset within the line (even) */
-    bool     field2;  /* interlace field id; unused (progressive only) */
+    bool     field2;  /* F bit: false=top/progressive, true=bottom field */
 } line_hdr_t;
 
 struct demux_sys_t
@@ -105,9 +105,14 @@ struct demux_sys_t
     bool     *p_line_filled;
     unsigned  i_lines_filled;
 
-    /* current in-progress frame */
+    /* current in-progress frame (progressive) */
     bool      b_frame_open;
     uint32_t  i_frame_ts;
+
+    /* current in-progress field pair (interlace only): whether a
+     * marker-terminated top (F=0) / bottom (F=1) field has been woven
+     * into the shared frame buffer since the last flush. */
+    bool      b_field_seen[2];
 };
 
 /* ------------------------------------------------------------------------ */
@@ -262,7 +267,13 @@ static void ResetFrameBuffer(demux_sys_t *p_sys)
  * segment is bounds-checked against height/stride before the memcpy: this
  * data comes straight off the wire and must never drive an out-of-bounds
  * write. Segments that fail validation are dropped (logged) and skipped;
- * the rest of the frame is still assembled best-effort. */
+ * the rest of the frame is still assembled best-effort.
+ *
+ * In interlace mode, the wire's Line No is a per-field line index (0 to
+ * height/2 - 1) and F (field2) selects top (0) or bottom (1); the two
+ * fields are woven into one full-height buffer as actual_line = line*2+F,
+ * matching how VLC expects a full picture. In progressive mode Line No is
+ * already the actual frame line and field2 is expected to be unset. */
 static void WriteLines(demux_t *p_demux, const line_hdr_t *lines, unsigned n_lines,
                         const uint8_t *pixels, size_t pixels_len)
 {
@@ -275,14 +286,9 @@ static void WriteLines(demux_t *p_demux, const line_hdr_t *lines, unsigned n_lin
         if (pos + seg_len > pixels_len)
             break;
 
-        if (lines[i].field2)
+        if (!p_sys->b_interlace && lines[i].field2)
         {
-            msg_Warn(p_demux, "dropping field-2 line segment (interlace unsupported)");
-        }
-        else if (lines[i].line >= p_sys->i_height)
-        {
-            msg_Warn(p_demux, "dropping line segment: line %u >= height %u",
-                      lines[i].line, p_sys->i_height);
+            msg_Warn(p_demux, "dropping field-2 line segment (not configured for interlace)");
         }
         else if (lines[i].offset % 2 != 0)
         {
@@ -290,19 +296,31 @@ static void WriteLines(demux_t *p_demux, const line_hdr_t *lines, unsigned n_lin
         }
         else
         {
+            unsigned field_lines = p_sys->b_interlace ? p_sys->i_height / 2 : p_sys->i_height;
+            if (lines[i].line >= field_lines)
+            {
+                msg_Warn(p_demux, "dropping line segment: line %u >= %u",
+                          lines[i].line, field_lines);
+                pos += seg_len;
+                continue;
+            }
+
+            unsigned actual_line = p_sys->b_interlace
+                                  ? (unsigned)lines[i].line * 2 + (lines[i].field2 ? 1 : 0)
+                                  : lines[i].line;
             size_t byte_off = ((size_t)lines[i].offset / 2) * 5;
             if (byte_off + seg_len > p_sys->i_stride_packed)
             {
                 msg_Warn(p_demux, "dropping line segment: exceeds line stride (line %u)",
-                          lines[i].line);
+                          actual_line);
             }
             else
             {
-                memcpy(p_sys->p_buf + (size_t)lines[i].line * p_sys->i_stride_packed + byte_off,
+                memcpy(p_sys->p_buf + (size_t)actual_line * p_sys->i_stride_packed + byte_off,
                        pixels + pos, seg_len);
-                if (!p_sys->p_line_filled[lines[i].line])
+                if (!p_sys->p_line_filled[actual_line])
                 {
-                    p_sys->p_line_filled[lines[i].line] = true;
+                    p_sys->p_line_filled[actual_line] = true;
                     p_sys->i_lines_filled++;
                 }
             }
@@ -442,14 +460,14 @@ static int Open(vlc_object_t *p_this)
         msg_Err(p_demux, "unsupported st2110-sampling (only YCbCr-4:2:2 is supported)");
         goto error;
     }
-    if (p_sys->b_interlace)
-    {
-        msg_Err(p_demux, "interlaced ST 2110-20 is not supported in this version");
-        goto error;
-    }
     if (p_sys->i_width == 0 || (p_sys->i_width % 2) != 0 || p_sys->i_height == 0)
     {
         msg_Err(p_demux, "invalid st2110-width/st2110-height");
+        goto error;
+    }
+    if (p_sys->b_interlace && (p_sys->i_height % 2) != 0)
+    {
+        msg_Err(p_demux, "invalid st2110-height for interlace (must be even, one field is height/2)");
         goto error;
     }
 
@@ -550,6 +568,39 @@ static int Demux(demux_t *p_demux)
         size_t         pixels_len;
         if (!ParseLineHeaders(payload, payload_len, lines, &n_lines, &pixels, &pixels_len))
             continue;
+
+        if (p_sys->b_interlace)
+        {
+            /* Each field carries its own RTP timestamp, so unlike the
+             * progressive path there's no single "current frame timestamp"
+             * to detect a lost marker against; a field is only considered
+             * done once its own marker arrives. Both fields weave into the
+             * same buffer (WriteLines maps line*2+F), and the full picture
+             * is sent once both top and bottom have each been marker-
+             * terminated since the last flush -- in whichever order they
+             * arrive. This does not recover from a lost field marker. */
+            WriteLines(p_demux, lines, n_lines, pixels, pixels_len);
+
+            if (marker && n_lines > 0)
+            {
+                unsigned field = lines[n_lines - 1].field2 ? 1 : 0;
+                p_sys->b_field_seen[field] = true;
+
+                if (p_sys->b_field_seen[0] && p_sys->b_field_seen[1])
+                {
+                    block_t *cur = FinalizeFrame(p_demux);
+                    ResetFrameBuffer(p_sys);
+                    p_sys->b_field_seen[0] = p_sys->b_field_seen[1] = false;
+                    if (cur)
+                    {
+                        es_out_Send(p_demux->out, p_sys->es, cur);
+                        return VLC_DEMUXER_SUCCESS;
+                    }
+                    /* frame dropped (too few lines received): keep reading */
+                }
+            }
+            continue;
+        }
 
         block_t *to_send = NULL;
 

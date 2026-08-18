@@ -25,6 +25,6 @@ make
 sudo make install   # or set VLC_PLUGIN_PATH to point at the build dir instead
 ```
 
-Then set `USE_CUSTOM_VIDEO = true` at the top of `src/st2110_sdp_loader.lua` so the Lua extension routes video through `st2110://` instead of the stock RTP path.
+Then tick "Use custom 10bit receiver" in the Lua extension's dialog before pressing Play, so it routes video through `st2110://` instead of the stock RTP path.
 
-This has not been build- or hardware-tested yet (see the spec's Open Questions §12 — VLC version, line-numbering origin, and loss-threshold tuning still need verification against a real ST 2110-20 sender).
+Interlaced ST 2110-20 (F bit / per-field line numbers) is supported by weaving both fields into one picture buffer; this has not been validated against a real interlaced sender (see the spec's Open Questions §12 — line-numbering origin and loss-threshold tuning still need verification against real hardware).

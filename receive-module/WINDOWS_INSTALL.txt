@@ -32,19 +32,12 @@ ST2110 SDP Loader for VLC (Windows) - インストール手順
 
 5. （任意）10bit映像を libst2110_plugin.dll 経由で受信する
    -----------------------------------
-   st2110_sdp_loader.lua をテキストエディタで開き、先頭付近の
-
-        local USE_CUSTOM_VIDEO = false
-
-   を
-
-        local USE_CUSTOM_VIDEO = true
-
-   に書き換えて再配置してください。false のままだと映像はVLC内蔵の
-   RTP経路（10bitパッキングは解けません）に渡り、音声のみが実質的に
-   再生対象になります。true にすると映像は libst2110_plugin.dll
-   （st2110://）経由になり、音声は引き続きVLC内蔵経路（input-slave）
-   で再生されます。
+   ダイアログ下部の「Use custom 10bit receiver」チェックボックスを
+   オンにしてから Play してください（ファイル編集は不要）。
+   オフのままだと映像はVLC内蔵のRTP経路（10bitパッキングは解けません）
+   に渡り、音声のみが実質的に再生対象になります。オンにすると映像は
+   libst2110_plugin.dll（st2110://）経由になり、音声は引き続き
+   VLC内蔵経路（input-slave）で再生されます。
 
 注意
 -----------------------------------
