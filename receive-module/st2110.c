@@ -282,6 +282,21 @@ static void ResetFrameBuffer(demux_sys_t *p_sys)
     p_sys->i_drop_field2 = p_sys->i_drop_offset = p_sys->i_drop_line_range = p_sys->i_drop_stride = 0;
 }
 
+/* RFC 4175 §"Header Format": Line No is NOT a compact 0-based per-field
+ * index -- it is the raw SMPTE analog raster scan line number, offset by
+ * that raster standard's blanking interval. Per RFC 4175 itself, for
+ * SMPTE 274M (the 1920x1080 family, the only raster this module supports):
+ *   progressive:        valid lines 42-1121   (1080 lines)
+ *   interlaced field one (F=0): valid lines 21-560   (540 lines)
+ *   interlaced field two (F=1): valid lines 584-1123  (540 lines)
+ * Getting this wrong doesn't corrupt a few lines: nearly every real segment
+ * falls outside a naive [0, height) or [0, height/2) check and gets
+ * dropped, which is why earlier bounds checks against a compact index
+ * silently discarded almost an entire real stream. */
+#define SMPTE274M_PROGRESSIVE_FIRST_LINE 42
+#define SMPTE274M_FIELD1_FIRST_LINE      21
+#define SMPTE274M_FIELD2_FIRST_LINE      584
+
 /* Writes each declared line segment into the packed frame buffer. Every
  * segment is bounds-checked against height/stride before the memcpy: this
  * data comes straight off the wire and must never drive an out-of-bounds
@@ -289,11 +304,9 @@ static void ResetFrameBuffer(demux_sys_t *p_sys)
  * per-segment -- see the i_drop_* counters and their summary log in
  * FinalizeFrame); the rest of the frame is still assembled best-effort.
  *
- * In interlace mode, the wire's Line No is a per-field line index (0 to
- * height/2 - 1) and F (field2) selects top (0) or bottom (1); the two
- * fields are woven into one full-height buffer as actual_line = line*2+F,
- * matching how VLC expects a full picture. In progressive mode Line No is
- * already the actual frame line and field2 is expected to be unset. */
+ * In interlace mode the two fields are woven into one full-height buffer
+ * as actual_line = field_relative_line*2+F, matching how VLC expects a
+ * full picture. */
 static void WriteLines(demux_t *p_demux, const line_hdr_t *lines, unsigned n_lines,
                         const uint8_t *pixels, size_t pixels_len)
 {
@@ -317,16 +330,21 @@ static void WriteLines(demux_t *p_demux, const line_hdr_t *lines, unsigned n_lin
         else
         {
             unsigned field_lines = p_sys->b_interlace ? p_sys->i_height / 2 : p_sys->i_height;
-            if (lines[i].line >= field_lines)
+            unsigned base = p_sys->b_interlace
+                           ? (lines[i].field2 ? SMPTE274M_FIELD2_FIRST_LINE : SMPTE274M_FIELD1_FIRST_LINE)
+                           : SMPTE274M_PROGRESSIVE_FIRST_LINE;
+
+            if (lines[i].line < base || (unsigned)lines[i].line - base >= field_lines)
             {
                 p_sys->i_drop_line_range++;
                 pos += seg_len;
                 continue;
             }
+            unsigned field_relative_line = (unsigned)lines[i].line - base;
 
             unsigned actual_line = p_sys->b_interlace
-                                  ? (unsigned)lines[i].line * 2 + (lines[i].field2 ? 1 : 0)
-                                  : lines[i].line;
+                                  ? field_relative_line * 2 + (lines[i].field2 ? 1 : 0)
+                                  : field_relative_line;
             size_t byte_off = ((size_t)lines[i].offset / 2) * 5;
             if (byte_off + seg_len > p_sys->i_stride_packed)
             {
@@ -493,12 +511,17 @@ static int Open(vlc_object_t *p_this)
         msg_Err(p_demux, "invalid st2110-width/st2110-height");
         goto error;
     }
-    if (p_sys->b_interlace && (p_sys->i_height % 2) != 0)
+    if (p_sys->i_height != 1080)
     {
-        msg_Err(p_demux, "invalid st2110-height for interlace (must be even, one field is height/2)");
+        /* WriteLines' RFC 4175 line-number decoding uses SMPTE 274M's
+         * fixed raster offsets (42/21/584); those are specific to the
+         * 1920x1080 family and wrong for any other raster standard
+         * (720p, 525i, 625i, ...), so reject rather than silently
+         * decode garbage. */
+        msg_Err(p_demux, "unsupported st2110-height=%u (only 1080 / SMPTE 274M is supported)",
+                 p_sys->i_height);
         goto error;
     }
-
     p_sys->fd = net_OpenDgram(p_this, psz_group, i_port,
                                (p_sys->psz_source && *p_sys->psz_source) ? p_sys->psz_source : NULL,
                                0, IPPROTO_UDP);
@@ -529,7 +552,11 @@ static int Open(vlc_object_t *p_this)
 
     p_sys->i_stride_packed = (size_t)(p_sys->i_width / 2) * 5;
     p_sys->i_buf_size      = p_sys->i_stride_packed * (size_t)p_sys->i_height;
-    p_sys->p_buf           = malloc(p_sys->i_buf_size);
+    /* calloc, not malloc: the first frame accumulated has no prior
+     * ResetFrameBuffer() call to zero it, so any line never received
+     * before the first flush would otherwise show as uninitialized
+     * heap garbage instead of black. */
+    p_sys->p_buf           = calloc(1, p_sys->i_buf_size);
     p_sys->p_line_filled   = calloc(p_sys->i_height, sizeof(bool));
     if (!p_sys->p_buf || !p_sys->p_line_filled)
         goto error;
@@ -723,7 +750,11 @@ static int Control(demux_t *p_demux, int i_query, va_list args)
             return VLC_SUCCESS;
 
         case DEMUX_CAN_CONTROL_PACE:
-            *va_arg(args, bool *) = true;
+            /* false: this is a live real-time source (matches modules/access/dvb
+             * and dtv in real VLC), not a file the core can pull ahead of and
+             * pace against PTS itself -- we already only deliver data as fast
+             * as the network provides it. */
+            *va_arg(args, bool *) = false;
             return VLC_SUCCESS;
 
         case DEMUX_GET_PTS_DELAY:
