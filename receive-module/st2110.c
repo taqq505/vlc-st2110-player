@@ -93,6 +93,7 @@ struct demux_sys_t
     unsigned  i_fps_num;
     unsigned  i_fps_den;
     bool      b_interlace;
+    int       line_mode; /* LINE_MODE_*, see WriteLines */
 
     /* socket */
     int       fd;
@@ -103,8 +104,14 @@ struct demux_sys_t
     /* packets ARE arriving but no frame has completed yet -- e.g. the
      * marker bit is never set by this sender, or (interlace) the two
      * fields never both get marker-terminated. Distinct from i_idle_polls
-     * (zero packets); logged on its own timer, see Demux(). */
-    unsigned i_packets_no_frame;
+     * (zero packets); logged on its own timer, see Demux(). Broken down by
+     * pipeline stage so a systematic parse failure (which would silently
+     * `continue` before ever reaching the old single counter) is visible
+     * too -- every net_Read'd packet is accounted for somewhere. */
+    unsigned i_pkts_total;
+    unsigned i_pkts_rtp_fail;
+    unsigned i_pkts_line_fail;
+    unsigned i_pkts_no_frame;
     mtime_t  i_last_no_frame_log;
 
     /* elementary stream */
@@ -289,20 +296,48 @@ static void ResetFrameBuffer(demux_sys_t *p_sys)
     p_sys->i_drop_field2 = p_sys->i_drop_offset = p_sys->i_drop_line_range = p_sys->i_drop_stride = 0;
 }
 
-/* RFC 4175 §"Header Format": Line No is NOT a compact 0-based per-field
- * index -- it is the raw SMPTE analog raster scan line number, offset by
- * that raster standard's blanking interval. Per RFC 4175 itself, for
- * SMPTE 274M (the 1920x1080 family, the only raster this module supports):
- *   progressive:        valid lines 42-1121   (1080 lines)
- *   interlaced field one (F=0): valid lines 21-560   (540 lines)
- *   interlaced field two (F=1): valid lines 584-1123  (540 lines)
- * Getting this wrong doesn't corrupt a few lines: nearly every real segment
- * falls outside a naive [0, height) or [0, height/2) check and gets
- * dropped, which is why earlier bounds checks against a compact index
- * silently discarded almost an entire real stream. */
-#define SMPTE274M_PROGRESSIVE_FIRST_LINE 42
-#define SMPTE274M_FIELD1_FIRST_LINE      21
-#define SMPTE274M_FIELD2_FIRST_LINE      584
+/* SMPTE ST 2110-20:2017 §6.1.5 Note 1 mandates the SRD Row Number ("Line
+ * No") be a ZERO-BASED sample row number, distinct from RFC 4175's own
+ * SMPTE-274M/296M raw-raster numbering (SDI-legacy, includes blanking).
+ * In practice, though, many real senders -- especially SDI-to-IP gateways
+ * carrying a camera's native SDI line numbers straight through -- emit the
+ * SDI-legacy numbers instead of renumbering to zero-based. A receiver that
+ * hardcodes either convention silently drops most of a real stream sent
+ * with the other one. So: detect which convention this sender is actually
+ * using from the observed values, rather than assume.
+ *
+ * For SMPTE 274M (1920x1080, the only raster this module supports) the two
+ * conventions are numerically disjoint for field two: zero-based field two
+ * is 0-539, SDI-legacy field two is 584-1123. LINE_MODE_SDI_LEGACY_MIN
+ * sits in the gap between them, so a single field-two packet settles it.
+ * Field one / progressive lines overlap between the conventions (21-539),
+ * but zero-based-only line 0-20 still disambiguates unassisted. */
+typedef enum { LINE_MODE_UNKNOWN = 0, LINE_MODE_ZERO_BASED, LINE_MODE_SDI_LEGACY } line_mode_t;
+
+#define SMPTE274M_PROGRESSIVE_BASE 42
+#define SMPTE274M_FIELD1_BASE      21
+#define SMPTE274M_FIELD2_BASE      584
+#define LINE_MODE_SDI_LEGACY_MIN   570  /* below SMPTE274M_FIELD2_BASE, above any zero-based field line */
+
+static void DetectLineMode(demux_t *p_demux, uint16_t raw_line)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    if (p_sys->line_mode != LINE_MODE_UNKNOWN)
+        return;
+
+    if (raw_line < SMPTE274M_FIELD1_BASE)
+    {
+        p_sys->line_mode = LINE_MODE_ZERO_BASED;
+        msg_Info(p_demux, "detected zero-based line numbering (ST 2110-20 spec convention; saw line %u)", raw_line);
+    }
+    else if (raw_line >= LINE_MODE_SDI_LEGACY_MIN)
+    {
+        p_sys->line_mode = LINE_MODE_SDI_LEGACY;
+        msg_Info(p_demux, "detected SDI-legacy (SMPTE 274M raw raster) line numbering "
+                  "(common on SDI-to-IP gateways; saw line %u)", raw_line);
+    }
+    /* else: still in the 21-569 overlap zone, keep waiting */
+}
 
 /* Writes each declared line segment into the packed frame buffer. Every
  * segment is bounds-checked against height/stride before the memcpy: this
@@ -310,6 +345,9 @@ static void ResetFrameBuffer(demux_sys_t *p_sys)
  * write. Segments that fail validation are dropped and counted (not logged
  * per-segment -- see the i_drop_* counters and their summary log in
  * FinalizeFrame); the rest of the frame is still assembled best-effort.
+ * Segments seen before the line-numbering convention is determined (see
+ * DetectLineMode) are also dropped as i_drop_line_range, since they can't
+ * be placed correctly yet -- this only costs the first field or so.
  *
  * In interlace mode the two fields are woven into one full-height buffer
  * as actual_line = field_relative_line*2+F, matching how VLC expects a
@@ -336,12 +374,17 @@ static void WriteLines(demux_t *p_demux, const line_hdr_t *lines, unsigned n_lin
         }
         else
         {
-            unsigned field_lines = p_sys->b_interlace ? p_sys->i_height / 2 : p_sys->i_height;
-            unsigned base = p_sys->b_interlace
-                           ? (lines[i].field2 ? SMPTE274M_FIELD2_FIRST_LINE : SMPTE274M_FIELD1_FIRST_LINE)
-                           : SMPTE274M_PROGRESSIVE_FIRST_LINE;
+            DetectLineMode(p_demux, lines[i].line);
 
-            if (lines[i].line < base || (unsigned)lines[i].line - base >= field_lines)
+            unsigned field_lines = p_sys->b_interlace ? p_sys->i_height / 2 : p_sys->i_height;
+            unsigned base = 0;
+            if (p_sys->line_mode == LINE_MODE_SDI_LEGACY)
+                base = p_sys->b_interlace
+                     ? (lines[i].field2 ? SMPTE274M_FIELD2_BASE : SMPTE274M_FIELD1_BASE)
+                     : SMPTE274M_PROGRESSIVE_BASE;
+
+            if (p_sys->line_mode == LINE_MODE_UNKNOWN
+             || lines[i].line < base || (unsigned)lines[i].line - base >= field_lines)
             {
                 p_sys->i_drop_line_range++;
                 pos += seg_len;
@@ -444,9 +487,18 @@ static block_t *FinalizeFrame(demux_t *p_demux)
 
 /* ------------------------------------------------------------------------ */
 
+/* Bump this string whenever st2110.c changes, and check for it in the VLC
+ * log (Tools/View > Messages) as the very first thing after "using
+ * access_demux module st2110" -- this build has repeatedly been debugged
+ * against stale .dll copies, so this removes all doubt about which build
+ * is actually running. */
+#define ST2110_BUILD_MARKER "st2110 build: auto-detect-lineno(zero-based+sdi-legacy)+pace-fix+staged-diag"
+
 static int Open(vlc_object_t *p_this)
 {
     demux_t *p_demux = (demux_t *)p_this;
+
+    msg_Info(p_demux, ST2110_BUILD_MARKER);
 
     if (!p_demux->psz_location || !*p_demux->psz_location)
     {
@@ -516,17 +568,6 @@ static int Open(vlc_object_t *p_this)
     if (p_sys->i_width == 0 || (p_sys->i_width % 2) != 0 || p_sys->i_height == 0)
     {
         msg_Err(p_demux, "invalid st2110-width/st2110-height");
-        goto error;
-    }
-    if (p_sys->i_height != 1080)
-    {
-        /* WriteLines' RFC 4175 line-number decoding uses SMPTE 274M's
-         * fixed raster offsets (42/21/584); those are specific to the
-         * 1920x1080 family and wrong for any other raster standard
-         * (720p, 525i, 625i, ...), so reject rather than silently
-         * decode garbage. */
-        msg_Err(p_demux, "unsupported st2110-height=%u (only 1080 / SMPTE 274M is supported)",
-                 p_sys->i_height);
         goto error;
     }
     p_sys->fd = net_OpenDgram(p_this, psz_group, i_port,
@@ -661,32 +702,47 @@ static int Demux(demux_t *p_demux)
         if (n == 0)
             continue;
 
-        uint32_t       ts;
-        bool           marker;
-        const uint8_t *payload;
-        size_t         payload_len;
-        if (!ParseRTP(pkt, (size_t)n, &ts, &marker, &payload, &payload_len))
-            continue;
+        p_sys->i_pkts_total++;
+
+        uint32_t       ts = 0;
+        bool           marker = false;
+        const uint8_t *payload = NULL;
+        size_t         payload_len = 0;
+        bool rtp_ok = ParseRTP(pkt, (size_t)n, &ts, &marker, &payload, &payload_len);
+        if (!rtp_ok)
+            p_sys->i_pkts_rtp_fail++;
 
         line_hdr_t     lines[MAX_LINE_HDRS];
-        unsigned       n_lines;
-        const uint8_t *pixels;
-        size_t         pixels_len;
-        if (!ParseLineHeaders(payload, payload_len, lines, &n_lines, &pixels, &pixels_len))
-            continue;
+        unsigned       n_lines = 0;
+        const uint8_t *pixels = NULL;
+        size_t         pixels_len = 0;
+        bool lines_ok = rtp_ok
+                       && ParseLineHeaders(payload, payload_len, lines, &n_lines, &pixels, &pixels_len);
+        if (rtp_ok && !lines_ok)
+            p_sys->i_pkts_line_fail++;
+        if (lines_ok)
+            p_sys->i_pkts_no_frame++;
 
-        p_sys->i_packets_no_frame++;
+        /* Every net_Read'd packet is now accounted for in exactly one of
+         * these counters (or a completed frame reset them all -- see the
+         * es_out_Send call sites below), so this fires every ~5s no matter
+         * which stage is actually the problem: silently discarding packets
+         * before this point (as the old single-counter version did) is
+         * exactly the failure mode that hid a systematic parse rejection. */
         mtime_t now = mdate();
         if (now - p_sys->i_last_no_frame_log > INT64_C(5000000) /* 5s */)
         {
-            msg_Warn(p_demux, "received %u valid RTP packets in the last ~5s with no "
-                      "completed frame sent -- the marker bit may never be set by this "
-                      "sender, or (interlace) the two fields never both get marker-"
-                      "terminated",
-                      p_sys->i_packets_no_frame);
-            p_sys->i_packets_no_frame  = 0;
+            msg_Warn(p_demux, "last ~5s: %u packets received, %u failed RTP header parse, "
+                      "%u failed line-header parse, %u parsed OK but no frame completed yet",
+                      p_sys->i_pkts_total, p_sys->i_pkts_rtp_fail,
+                      p_sys->i_pkts_line_fail, p_sys->i_pkts_no_frame);
+            p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = p_sys->i_pkts_line_fail
+                                 = p_sys->i_pkts_no_frame = 0;
             p_sys->i_last_no_frame_log = now;
         }
+
+        if (!lines_ok)
+            continue;
 
         if (p_sys->b_interlace)
         {
@@ -712,7 +768,8 @@ static int Demux(demux_t *p_demux)
                     p_sys->b_field_seen[0] = p_sys->b_field_seen[1] = false;
                     if (cur)
                     {
-                        p_sys->i_packets_no_frame = 0;
+                        p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = p_sys->i_pkts_line_fail
+                                             = p_sys->i_pkts_no_frame = 0;
                         es_out_Send(p_demux->out, p_sys->es, cur);
                         return VLC_DEMUXER_SUCCESS;
                     }
@@ -741,7 +798,8 @@ static int Demux(demux_t *p_demux)
 
         if (to_send)
         {
-            p_sys->i_packets_no_frame = 0;
+            p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = p_sys->i_pkts_line_fail
+                                 = p_sys->i_pkts_no_frame = 0;
             es_out_Send(p_demux->out, p_sys->es, to_send);
             return VLC_DEMUXER_SUCCESS;
         }
@@ -753,7 +811,8 @@ static int Demux(demux_t *p_demux)
             p_sys->b_frame_open = false;
             if (cur)
             {
-                p_sys->i_packets_no_frame = 0;
+                p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = p_sys->i_pkts_line_fail
+                                     = p_sys->i_pkts_no_frame = 0;
                 es_out_Send(p_demux->out, p_sys->es, cur);
                 return VLC_DEMUXER_SUCCESS;
             }
