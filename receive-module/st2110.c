@@ -40,6 +40,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+# include <errno.h>
+#endif
 
 static int  Open(vlc_object_t *);
 static void Close(vlc_object_t *);
@@ -93,6 +96,9 @@ struct demux_sys_t
 
     /* socket */
     int       fd;
+    char      psz_group[256];
+    int       i_port;
+    unsigned  i_idle_polls; /* consecutive receive timeouts with zero data */
 
     /* elementary stream */
     es_out_id_t *es;
@@ -455,6 +461,8 @@ static int Open(vlc_object_t *p_this)
         return VLC_ENOMEM;
     p_demux->p_sys = p_sys;
     p_sys->fd = -1;
+    memcpy(p_sys->psz_group, psz_group, sizeof(psz_group));
+    p_sys->i_port = i_port;
 
     p_sys->psz_source      = var_InheritString(p_demux, "st2110-source");
     p_sys->i_width          = var_InheritInteger(p_demux, "st2110-width");
@@ -503,6 +511,21 @@ static int Open(vlc_object_t *p_this)
         int i_rcvbuf = 32 * 1024 * 1024;
         setsockopt(p_sys->fd, SOL_SOCKET, SO_RCVBUF, (const char *)&i_rcvbuf, sizeof(i_rcvbuf));
     }
+    /* Without a receive timeout, Demux() blocks in net_Read forever if no
+     * packets ever arrive (wrong SSM source, no PIM-SSM route to this host,
+     * a firewall, ...) with zero visibility into why. Timing out lets
+     * Demux() log periodic diagnostics instead of just sitting silent. */
+#ifdef _WIN32
+    {
+        DWORD timeout_ms = 2000;
+        setsockopt(p_sys->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
+    }
+#else
+    {
+        struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+        setsockopt(p_sys->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+    }
+#endif
 
     p_sys->i_stride_packed = (size_t)(p_sys->i_width / 2) * 5;
     p_sys->i_buf_size      = p_sys->i_stride_packed * (size_t)p_sys->i_height;
@@ -559,6 +582,18 @@ static void Close(vlc_object_t *p_this)
     p_demux->p_sys = NULL;
 }
 
+/* True if the last socket call failed merely because SO_RCVTIMEO elapsed
+ * with no data (i.e. not a real error). */
+static bool LastRecvTimedOut(void)
+{
+#ifdef _WIN32
+    int e = WSAGetLastError();
+    return e == WSAETIMEDOUT || e == WSAEWOULDBLOCK;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT;
+#endif
+}
+
 /* Reads packets until one full frame is assembled (marker bit), or a
  * timestamp change reveals that the previous frame's marker was lost, then
  * sends exactly one block and returns -- per spec §5.3. */
@@ -571,7 +606,23 @@ static int Demux(demux_t *p_demux)
     {
         ssize_t n = net_Read(VLC_OBJECT(p_demux), p_sys->fd, pkt, sizeof(pkt));
         if (n < 0)
+        {
+            if (LastRecvTimedOut())
+            {
+                p_sys->i_idle_polls++;
+                /* SO_RCVTIMEO is 2s; log roughly every 10s of total silence,
+                 * not every timeout, to stay well clear of the message-flood
+                 * failure mode this module hit before (see WriteLines). */
+                if (p_sys->i_idle_polls % 5 == 1)
+                    msg_Warn(p_demux, "no data received in %us on %s:%d (SSM source \"%s\") "
+                              "-- check multicast routing/PIM-SSM reachability from this host",
+                              p_sys->i_idle_polls * 2, p_sys->psz_group, p_sys->i_port,
+                              (p_sys->psz_source && *p_sys->psz_source) ? p_sys->psz_source : "(none/ASM)");
+                continue;
+            }
             return VLC_DEMUXER_EGENERIC;
+        }
+        p_sys->i_idle_polls = 0;
         if (n == 0)
             continue;
 
