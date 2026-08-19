@@ -105,6 +105,18 @@ struct demux_sys_t
     bool     *p_line_filled;
     unsigned  i_lines_filled;
 
+    /* line-segment drop counters for the frame currently being assembled.
+     * Logged as one summary per frame in FinalizeFrame rather than per
+     * packet: on a real high-bitrate stream a systematic mismatch (e.g.
+     * wrong line-numbering assumption) can drop the large majority of
+     * packets, and logging each one can emit tens of thousands of lines
+     * per second -- enough to flood VLC's message console and hang the
+     * whole UI, especially with the Messages window open. */
+    unsigned  i_drop_field2;
+    unsigned  i_drop_offset;
+    unsigned  i_drop_line_range;
+    unsigned  i_drop_stride;
+
     /* current in-progress frame (progressive) */
     bool      b_frame_open;
     uint32_t  i_frame_ts;
@@ -261,13 +273,15 @@ static void ResetFrameBuffer(demux_sys_t *p_sys)
     memset(p_sys->p_buf, 0, p_sys->i_buf_size);
     memset(p_sys->p_line_filled, 0, p_sys->i_height * sizeof(bool));
     p_sys->i_lines_filled = 0;
+    p_sys->i_drop_field2 = p_sys->i_drop_offset = p_sys->i_drop_line_range = p_sys->i_drop_stride = 0;
 }
 
 /* Writes each declared line segment into the packed frame buffer. Every
  * segment is bounds-checked against height/stride before the memcpy: this
  * data comes straight off the wire and must never drive an out-of-bounds
- * write. Segments that fail validation are dropped (logged) and skipped;
- * the rest of the frame is still assembled best-effort.
+ * write. Segments that fail validation are dropped and counted (not logged
+ * per-segment -- see the i_drop_* counters and their summary log in
+ * FinalizeFrame); the rest of the frame is still assembled best-effort.
  *
  * In interlace mode, the wire's Line No is a per-field line index (0 to
  * height/2 - 1) and F (field2) selects top (0) or bottom (1); the two
@@ -288,19 +302,18 @@ static void WriteLines(demux_t *p_demux, const line_hdr_t *lines, unsigned n_lin
 
         if (!p_sys->b_interlace && lines[i].field2)
         {
-            msg_Warn(p_demux, "dropping field-2 line segment (not configured for interlace)");
+            p_sys->i_drop_field2++;
         }
         else if (lines[i].offset % 2 != 0)
         {
-            msg_Warn(p_demux, "dropping line segment: odd pixel offset %u", lines[i].offset);
+            p_sys->i_drop_offset++;
         }
         else
         {
             unsigned field_lines = p_sys->b_interlace ? p_sys->i_height / 2 : p_sys->i_height;
             if (lines[i].line >= field_lines)
             {
-                msg_Warn(p_demux, "dropping line segment: line %u >= %u",
-                          lines[i].line, field_lines);
+                p_sys->i_drop_line_range++;
                 pos += seg_len;
                 continue;
             }
@@ -311,8 +324,7 @@ static void WriteLines(demux_t *p_demux, const line_hdr_t *lines, unsigned n_lin
             size_t byte_off = ((size_t)lines[i].offset / 2) * 5;
             if (byte_off + seg_len > p_sys->i_stride_packed)
             {
-                msg_Warn(p_demux, "dropping line segment: exceeds line stride (line %u)",
-                          actual_line);
+                p_sys->i_drop_stride++;
             }
             else
             {
@@ -338,6 +350,14 @@ static void WriteLines(demux_t *p_demux, const line_hdr_t *lines, unsigned n_lin
 static block_t *FinalizeFrame(demux_t *p_demux)
 {
     demux_sys_t *p_sys = p_demux->p_sys;
+
+    if (p_sys->i_drop_field2 || p_sys->i_drop_offset || p_sys->i_drop_line_range || p_sys->i_drop_stride)
+    {
+        msg_Warn(p_demux, "dropped segments this frame: field2=%u odd-offset=%u "
+                  "line-range=%u stride=%u",
+                  p_sys->i_drop_field2, p_sys->i_drop_offset,
+                  p_sys->i_drop_line_range, p_sys->i_drop_stride);
+    }
 
     if (p_sys->i_lines_filled < p_sys->i_height / 2)
     {

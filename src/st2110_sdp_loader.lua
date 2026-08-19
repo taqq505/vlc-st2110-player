@@ -199,32 +199,39 @@ local function compute_frame_ms(parsed_v, parsed_a)
   return nil
 end
 
+-- VLC 全体のクロック同期・ジッタバッファに使われる値なので、0(や極端に小さい値)を
+-- 渡すとコア側のスケジューリングが破綻しうる。実運用上意味のある下限を強制する。
+local MIN_CACHING_MS = 20
+
 -- "200"(ms) / "2s"(秒) / "30f"(フレーム, frame_ms が必要) を ms に変換する。
 local function parse_caching_ms(input, frame_ms)
   input = trim(input or "")
+
+  local ms
   if input == "" then
-    return 200
-  end
-
-  local sec = input:match("^([%d%.]+)%s*[sS]$")
-  if sec then
-    return tonumber(sec) * 1000
-  end
-
-  local frames = input:match("^([%d%.]+)%s*[fF]$")
-  if frames then
-    if not frame_ms then
-      return nil, "フレーム指定には映像のフレームレートか音声の ptime が必要です"
+    ms = 200
+  else
+    local sec = input:match("^([%d%.]+)%s*[sS]$")
+    local frames = input:match("^([%d%.]+)%s*[fF]$")
+    if sec then
+      ms = tonumber(sec) * 1000
+    elseif frames then
+      if not frame_ms then
+        return nil, "フレーム指定には映像のフレームレートか音声の ptime が必要です"
+      end
+      ms = tonumber(frames) * frame_ms
+    else
+      ms = tonumber(input)
+      if not ms then
+        return nil, "network caching の形式が不正です (例: 200 / 2s / 30f)"
+      end
     end
-    return tonumber(frames) * frame_ms
   end
 
-  local ms = tonumber(input)
-  if ms then
-    return ms
+  if ms < MIN_CACHING_MS then
+    return nil, "network caching は " .. MIN_CACHING_MS .. "ms 以上を指定してください"
   end
-
-  return nil, "network caching の形式が不正です (例: 200 / 2s / 30f)"
+  return ms
 end
 
 -- 独自 access_demux モジュール（st2110://）向けの MRL 契約（仕様書 §11）。
@@ -299,9 +306,15 @@ function play()
   if a ~= "" then write_sdp(CACHE_AUDIO_NAME, a) end
 
   local parsed_v = (v ~= "") and parse_sdp(v) or nil
-  local parsed_a = (a ~= "") and parse_sdp(a) or nil
 
-  local caching_ms, caching_err = parse_caching_ms(caching_box:get_text(), compute_frame_ms(parsed_v, parsed_a))
+  -- 音声SDPのパースは network-caching が "30f" のようなフレーム数指定の
+  -- ときだけ必要。普段の ms 指定では走らせない（新規追加コードの影響範囲を
+  -- 最小化するため、常時パースはしない）。
+  local caching_input = trim(caching_box:get_text())
+  local needs_frame_ms = caching_input:match("[fF]$") ~= nil
+  local parsed_a = (needs_frame_ms and a ~= "") and parse_sdp(a) or nil
+
+  local caching_ms, caching_err = parse_caching_ms(caching_input, compute_frame_ms(parsed_v, parsed_a))
   if not caching_ms then
     status:set_text(caching_err)
     return
