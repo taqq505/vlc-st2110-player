@@ -100,6 +100,13 @@ struct demux_sys_t
     int       i_port;
     unsigned  i_idle_polls; /* consecutive receive timeouts with zero data */
 
+    /* packets ARE arriving but no frame has completed yet -- e.g. the
+     * marker bit is never set by this sender, or (interlace) the two
+     * fields never both get marker-terminated. Distinct from i_idle_polls
+     * (zero packets); logged on its own timer, see Demux(). */
+    unsigned i_packets_no_frame;
+    mtime_t  i_last_no_frame_log;
+
     /* elementary stream */
     es_out_id_t *es;
     mtime_t      i_pts_delay;
@@ -560,6 +567,7 @@ static int Open(vlc_object_t *p_this)
     p_sys->p_line_filled   = calloc(p_sys->i_height, sizeof(bool));
     if (!p_sys->p_buf || !p_sys->p_line_filled)
         goto error;
+    p_sys->i_last_no_frame_log = mdate();
 
     p_sys->i_pts_delay = (mtime_t)var_InheritInteger(p_demux, "network-caching") * INT64_C(1000);
     if (p_sys->i_pts_delay <= 0)
@@ -667,6 +675,19 @@ static int Demux(demux_t *p_demux)
         if (!ParseLineHeaders(payload, payload_len, lines, &n_lines, &pixels, &pixels_len))
             continue;
 
+        p_sys->i_packets_no_frame++;
+        mtime_t now = mdate();
+        if (now - p_sys->i_last_no_frame_log > INT64_C(5000000) /* 5s */)
+        {
+            msg_Warn(p_demux, "received %u valid RTP packets in the last ~5s with no "
+                      "completed frame sent -- the marker bit may never be set by this "
+                      "sender, or (interlace) the two fields never both get marker-"
+                      "terminated",
+                      p_sys->i_packets_no_frame);
+            p_sys->i_packets_no_frame  = 0;
+            p_sys->i_last_no_frame_log = now;
+        }
+
         if (p_sys->b_interlace)
         {
             /* Each field carries its own RTP timestamp, so unlike the
@@ -691,6 +712,7 @@ static int Demux(demux_t *p_demux)
                     p_sys->b_field_seen[0] = p_sys->b_field_seen[1] = false;
                     if (cur)
                     {
+                        p_sys->i_packets_no_frame = 0;
                         es_out_Send(p_demux->out, p_sys->es, cur);
                         return VLC_DEMUXER_SUCCESS;
                     }
@@ -719,6 +741,7 @@ static int Demux(demux_t *p_demux)
 
         if (to_send)
         {
+            p_sys->i_packets_no_frame = 0;
             es_out_Send(p_demux->out, p_sys->es, to_send);
             return VLC_DEMUXER_SUCCESS;
         }
@@ -730,6 +753,7 @@ static int Demux(demux_t *p_demux)
             p_sys->b_frame_open = false;
             if (cur)
             {
+                p_sys->i_packets_no_frame = 0;
                 es_out_Send(p_demux->out, p_sys->es, cur);
                 return VLC_DEMUXER_SUCCESS;
             }
