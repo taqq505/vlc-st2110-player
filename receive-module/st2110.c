@@ -35,6 +35,7 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 
 #ifndef _WIN32
 # include <poll.h>
@@ -54,6 +55,14 @@
 #define DEFAULT_FPS_DEN        1001
 
 #define SO_RCVBUF_SIZE (32 * 1024 * 1024)
+
+/* Pixel-unpacking is the CPU-heavy part of this module (tens of millions of
+ * pgroup unpacks/sec for full HD 4:2:2 10bit); the receive thread hands it
+ * off to these workers so recv()/poll() itself never falls behind and
+ * starves the OS socket buffer. 4-core assumption: 1 receive thread + 3
+ * workers. */
+#define N_WORKERS    3
+#define QUEUE_SLOTS 32
 
 /*
  * SMPTE ST 2110-20:2017 6.1.5 defines the SRD Line No as zero-based. In
@@ -82,6 +91,33 @@ typedef struct {
     uint16_t offset;      /* raw 15-bit sample offset within the line      */
 } rfc4175_line_hdr_t;
 
+/* One packet's worth of already-parsed headers plus its raw payload bytes,
+ * queued from the receive thread to a worker for unpacking. */
+typedef struct {
+    rfc4175_line_hdr_t hdrs[MAX_LINE_SEGMENTS];
+    unsigned            n_hdrs;
+    uint8_t             data[RECV_BUF_LEN];
+    size_t              data_len;
+} work_item_t;
+
+/* Single-producer (the receive thread) / single-consumer (one worker)
+ * bounded queue. SPSC keeps the concurrency reasoning simple: the only
+ * two parties touching `head`/`tail` are always the same two threads. */
+typedef struct {
+    vlc_mutex_t lock;
+    vlc_cond_t  cond_work;     /* signaled: an item became available */
+    vlc_cond_t  cond_space;    /* signaled: a slot was freed */
+    vlc_cond_t  cond_drained;  /* signaled: pending reached 0 */
+    work_item_t items[QUEUE_SLOTS];
+    unsigned    head, tail, count, pending;
+    bool        b_shutdown;
+} worker_queue_t;
+
+typedef struct {
+    demux_t *p_demux;
+    unsigned idx;
+} worker_ctx_t;
+
 struct demux_sys_t
 {
     /* network */
@@ -106,23 +142,40 @@ struct demux_sys_t
     date_t       pts;
 
     /* frame accumulation (tightly packed planar I422_10L: Y, U, V) */
-    uint8_t *p_buf;
-    size_t   i_buf_size;
-    size_t   i_y_plane_size;
-    size_t   i_uv_plane_size;
-    bool    *p_line_filled;
-    unsigned i_lines_filled;
-    bool     b_seen_field2_pkt;
+    uint8_t     *p_buf;
+    size_t       i_buf_size;
+    size_t       i_y_plane_size;
+    size_t       i_uv_plane_size;
+    atomic_bool *p_line_filled;   /* written by multiple workers concurrently */
+    atomic_uint  i_lines_filled;
 
-    /* per-frame drop counters, reset after each finalized/dropped frame */
-    unsigned i_drop_field2;
-    unsigned i_drop_offset;
-    unsigned i_drop_line_range;
-    unsigned i_drop_stride;
+    /* Field/frame boundary detection for interlace (see ReceiveThread):
+       driven by RTP timestamp changes rather than the marker bit, since
+       RFC4175 guarantees every packet of a field shares one timestamp,
+       while marker-bearing packets can be lost or reordered. Touched only
+       by the (single) receive thread, so plain types are fine. */
+    bool     b_accum_started;
+    uint32_t i_accum_ts;
+    unsigned i_field_count;
+
+    /* per-frame drop counters, reset after each finalized/dropped frame;
+       written from multiple workers concurrently, hence atomic */
+    atomic_uint i_drop_field2;
+    atomic_uint i_drop_offset;
+    atomic_uint i_drop_line_range;
+    atomic_uint i_drop_stride;
 
     /* receive thread */
     vlc_thread_t thread;
     bool         b_thread_started;
+
+    /* pixel-unpack worker pool (see WriteLines/WorkerThread) */
+    worker_queue_t queues[N_WORKERS];
+    vlc_thread_t   worker_threads[N_WORKERS];
+    worker_ctx_t   worker_ctx[N_WORKERS];
+    unsigned       n_workers_started;
+    unsigned       i_next_worker;
+    bool           b_queues_initialized;
 
     /* rolling diagnostics, reset every ~5s */
     mtime_t  i_stat_window_start;
@@ -137,6 +190,7 @@ static int  Open(vlc_object_t *);
 static void Close(vlc_object_t *);
 static int  Control(demux_t *, int, va_list);
 static void *ReceiveThread(void *);
+static void *WorkerThread(void *);
 
 vlc_module_begin()
     set_shortname("ST2110")
@@ -311,12 +365,10 @@ static bool MapLine(const demux_sys_t *p_sys, const rfc4175_line_hdr_t *h,
 }
 
 /* Unpacks RFC4175 YCbCr-4:2:2 10bit GPM pgroups (5 bytes -> Cb,Y0,Cr,Y1)
- * directly into the picture buffer's Y/U/V planes. Returns true if any
- * header in this packet belonged to field two. */
-static bool WriteLines(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
+ * directly into the picture buffer's Y/U/V planes. */
+static void WriteLines(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
                         unsigned n_hdrs, const uint8_t *data, size_t data_len)
 {
-    bool b_saw_field2 = false;
     size_t off = 0;
     unsigned half_w = p_sys->i_width / 2;
 
@@ -327,8 +379,6 @@ static bool WriteLines(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
 
     for (unsigned i = 0; i < n_hdrs; i++) {
         const rfc4175_line_hdr_t *h = &hdrs[i];
-        if (h->field2)
-            b_saw_field2 = true;
 
         if (off + h->length > data_len) {
             p_sys->i_drop_stride++;
@@ -340,7 +390,7 @@ static bool WriteLines(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
             off += h->length;
             continue;
         }
-        if (h->length % 5 != 0 || h->offset % 2 != 0) {
+        if (h->length % 5 != 0 || h->offset % 2 != 0 || h->offset >= p_sys->i_width) {
             p_sys->i_drop_stride++;
             off += h->length;
             continue;
@@ -355,38 +405,123 @@ static bool WriteLines(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
 
         unsigned n_pgroups = h->length / 5;
         const uint8_t *seg = data + off;
-        bool line_ok = true;
+
+        /* Bounds-check once per segment instead of once per pgroup: the
+           inner loop runs up to ~31M times/sec for a full HD 4:2:2 10bit
+           feed, so a branch on every iteration is measurable overhead. */
+        unsigned max_pgroups = (p_sys->i_width - h->offset) / 2;
+        if (n_pgroups > max_pgroups) {
+            n_pgroups = max_pgroups;
+            p_sys->i_drop_stride++;
+        }
+
+        uint16_t *y_row = y_plane + (size_t)out_line * p_sys->i_width + h->offset;
+        uint16_t *u_row = u_plane + (size_t)out_line * half_w + h->offset / 2;
+        uint16_t *v_row = v_plane + (size_t)out_line * half_w + h->offset / 2;
 
         for (unsigned j = 0; j < n_pgroups; j++) {
-            unsigned x = h->offset + j * 2;
-            if (x + 1 >= p_sys->i_width) {
-                line_ok = false;
-                break;
-            }
-
             const uint8_t *b = seg + j * 5;
             uint16_t cb = (uint16_t)((b[0] << 2) | (b[1] >> 6));
             uint16_t y0 = (uint16_t)(((b[1] & 0x3f) << 4) | (b[2] >> 4));
             uint16_t cr = (uint16_t)(((b[2] & 0x0f) << 6) | (b[3] >> 2));
             uint16_t y1 = (uint16_t)(((b[3] & 0x03) << 8) | b[4]);
 
-            y_plane[out_line * p_sys->i_width + x]     = y0;
-            y_plane[out_line * p_sys->i_width + x + 1] = y1;
-            u_plane[out_line * half_w + x / 2]          = cb;
-            v_plane[out_line * half_w + x / 2]          = cr;
+            y_row[j * 2]     = y0;
+            y_row[j * 2 + 1] = y1;
+            u_row[j]         = cb;
+            v_row[j]         = cr;
         }
-        if (!line_ok)
-            p_sys->i_drop_stride++;
 
-        if (!p_sys->p_line_filled[out_line]) {
-            p_sys->p_line_filled[out_line] = true;
+        /* atomic_exchange, not a separate load+store: two workers can touch
+           the same output line (its packets round-robin across workers by
+           packet, not by line), so "check then set" would race. */
+        if (!atomic_exchange(&p_sys->p_line_filled[out_line], true))
             p_sys->i_lines_filled++;
-        }
 
         off += h->length;
     }
+}
 
-    return b_saw_field2;
+/* Hands one packet's parsed headers + payload to worker `q` for unpacking.
+ * Copies into the slot (not just a pointer) so the receive thread's own
+ * stack packet buffer can be reused for the next recv() immediately. */
+static void EnqueueWork(worker_queue_t *q, const rfc4175_line_hdr_t *hdrs,
+                         unsigned n_hdrs, const uint8_t *data, size_t data_len)
+{
+    vlc_mutex_lock(&q->lock);
+    while (q->count == QUEUE_SLOTS)
+        vlc_cond_wait(&q->cond_space, &q->lock);
+
+    work_item_t *slot = &q->items[q->tail];
+    memcpy(slot->hdrs, hdrs, n_hdrs * sizeof(*hdrs));
+    slot->n_hdrs = n_hdrs;
+    memcpy(slot->data, data, data_len);
+    slot->data_len = data_len;
+
+    q->tail = (q->tail + 1) % QUEUE_SLOTS;
+    q->count++;
+    q->pending++;
+    vlc_cond_signal(&q->cond_work);
+    vlc_mutex_unlock(&q->lock);
+}
+
+/* Round-robins packets across the worker pool. */
+static void DispatchWork(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
+                          unsigned n_hdrs, const uint8_t *data, size_t data_len)
+{
+    worker_queue_t *q = &p_sys->queues[p_sys->i_next_worker];
+    p_sys->i_next_worker = (p_sys->i_next_worker + 1) % N_WORKERS;
+    EnqueueWork(q, hdrs, n_hdrs, data, data_len);
+}
+
+/* Blocks until every item already enqueued on `q` has been fully unpacked.
+ * Must be called (for every queue) before FinalizeFrame reads the picture
+ * buffer, so no worker is still writing into it. */
+static void DrainQueue(worker_queue_t *q)
+{
+    vlc_mutex_lock(&q->lock);
+    while (q->pending != 0)
+        vlc_cond_wait(&q->cond_drained, &q->lock);
+    vlc_mutex_unlock(&q->lock);
+}
+
+static void DrainAllWorkers(demux_sys_t *p_sys)
+{
+    for (unsigned i = 0; i < N_WORKERS; i++)
+        DrainQueue(&p_sys->queues[i]);
+}
+
+static void *WorkerThread(void *data)
+{
+    worker_ctx_t *ctx = data;
+    demux_sys_t *p_sys = ctx->p_demux->p_sys;
+    worker_queue_t *q = &p_sys->queues[ctx->idx];
+
+    for (;;) {
+        vlc_mutex_lock(&q->lock);
+        while (q->count == 0 && !q->b_shutdown)
+            vlc_cond_wait(&q->cond_work, &q->lock);
+        if (q->count == 0 && q->b_shutdown) {
+            vlc_mutex_unlock(&q->lock);
+            break;
+        }
+
+        work_item_t item = q->items[q->head];
+        q->head = (q->head + 1) % QUEUE_SLOTS;
+        q->count--;
+        vlc_cond_signal(&q->cond_space);
+        vlc_mutex_unlock(&q->lock);
+
+        WriteLines(p_sys, item.hdrs, item.n_hdrs, item.data, item.data_len);
+
+        vlc_mutex_lock(&q->lock);
+        q->pending--;
+        if (q->pending == 0)
+            vlc_cond_signal(&q->cond_drained);
+        vlc_mutex_unlock(&q->lock);
+    }
+
+    return NULL;
 }
 
 static void FinalizeFrame(demux_t *p_demux, demux_sys_t *p_sys)
@@ -406,15 +541,34 @@ static void FinalizeFrame(demux_t *p_demux, demux_sys_t *p_sys)
         date_Increment(&p_sys->pts, 1);
     }
 
+    /* Minor per-frame shortfall is normal on a live uncompressed feed; only
+       log when it's bad enough to be worth a human's attention, so this
+       doesn't itself become a meaningful CPU cost at ~30-60 calls/sec. */
     if (p_sys->i_drop_field2 || p_sys->i_drop_offset || p_sys->i_drop_line_range
-     || p_sys->i_drop_stride || p_sys->i_lines_filled < p_sys->i_height) {
+     || p_sys->i_drop_stride || p_sys->i_lines_filled < min_lines) {
         msg_Warn(p_demux, "st2110: frame lines=%u/%u drop(field2=%u offset=%u range=%u stride=%u)",
                  p_sys->i_lines_filled, p_sys->i_height, p_sys->i_drop_field2,
                  p_sys->i_drop_offset, p_sys->i_drop_line_range, p_sys->i_drop_stride);
     }
 
-    memset(p_sys->p_buf, 0, p_sys->i_buf_size);
-    memset(p_sys->p_line_filled, 0, p_sys->i_height * sizeof(bool));
+    /* Clear only the lines that were actually written this cycle, not the
+       whole ~8MB buffer -- lines left untouched are already zero from a
+       previous clear (or from the initial calloc), so re-zeroing them here
+       would be wasted work on every single frame. */
+    unsigned half_w = p_sys->i_width / 2;
+    size_t y_row_bytes = (size_t)p_sys->i_width * 2;
+    size_t uv_row_bytes = (size_t)half_w * 2;
+    uint8_t *y_plane = p_sys->p_buf;
+    uint8_t *u_plane = p_sys->p_buf + p_sys->i_y_plane_size;
+    uint8_t *v_plane = p_sys->p_buf + p_sys->i_y_plane_size + p_sys->i_uv_plane_size;
+    for (unsigned line = 0; line < p_sys->i_height; line++) {
+        if (!p_sys->p_line_filled[line])
+            continue;
+        memset(y_plane + (size_t)line * y_row_bytes, 0, y_row_bytes);
+        memset(u_plane + (size_t)line * uv_row_bytes, 0, uv_row_bytes);
+        memset(v_plane + (size_t)line * uv_row_bytes, 0, uv_row_bytes);
+        p_sys->p_line_filled[line] = false;
+    }
     p_sys->i_lines_filled = 0;
     p_sys->i_drop_field2 = p_sys->i_drop_offset = 0;
     p_sys->i_drop_line_range = p_sys->i_drop_stride = 0;
@@ -494,14 +648,34 @@ static void *ReceiveThread(void *data)
 
         DetectLineMode(p_demux, p_sys, hdrs, n_hdrs);
 
-        bool saw_field2 = WriteLines(p_sys, hdrs, n_hdrs,
-                                      payload + hdr_bytes, payload_len - hdr_bytes);
-        if (saw_field2)
-            p_sys->b_seen_field2_pkt = true;
-
-        if (marker && (!p_sys->b_interlace || p_sys->b_seen_field2_pkt)) {
-            FinalizeFrame(p_demux, p_sys);
-            p_sys->b_seen_field2_pkt = false;
+        if (p_sys->b_interlace) {
+            /* Field/frame boundaries are delimited by RTP timestamp changes
+               (RFC4175: every packet of one field shares one timestamp),
+               not by the marker bit -- a lost or reordered marker packet
+               must not be able to desync the field count. Two distinct
+               timestamps = one complete interlaced frame (field one, field
+               two); the third distinct timestamp means the next frame has
+               started, so finalize before folding its data in. */
+            if (!p_sys->b_accum_started) {
+                p_sys->b_accum_started = true;
+                p_sys->i_accum_ts = ts;
+                p_sys->i_field_count = 1;
+            } else if (ts != p_sys->i_accum_ts) {
+                p_sys->i_accum_ts = ts;
+                p_sys->i_field_count++;
+                if (p_sys->i_field_count > 2) {
+                    DrainAllWorkers(p_sys);   /* wait out the field just finished */
+                    FinalizeFrame(p_demux, p_sys);
+                    p_sys->i_field_count = 1;
+                }
+            }
+            DispatchWork(p_sys, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
+        } else {
+            DispatchWork(p_sys, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
+            if (marker) {
+                DrainAllWorkers(p_sys);
+                FinalizeFrame(p_demux, p_sys);
+            }
         }
 
         if (mdate() - p_sys->i_stat_window_start > 5 * CLOCK_FREQ) {
@@ -615,7 +789,7 @@ static int Open(vlc_object_t *obj)
     p_sys->i_uv_plane_size = (size_t)(p_sys->i_width / 2) * p_sys->i_height * 2;
     p_sys->i_buf_size = p_sys->i_y_plane_size + 2 * p_sys->i_uv_plane_size;
     p_sys->p_buf = calloc(1, p_sys->i_buf_size);
-    p_sys->p_line_filled = calloc(p_sys->i_height, sizeof(bool));
+    p_sys->p_line_filled = calloc(p_sys->i_height, sizeof(atomic_bool));
     if (!p_sys->p_buf || !p_sys->p_line_filled)
         goto error;
 
@@ -645,6 +819,26 @@ static int Open(vlc_object_t *obj)
              p_sys->psz_group, p_sys->i_port, p_sys->i_width, p_sys->i_height,
              p_sys->b_interlace, p_sys->i_fps_num, p_sys->i_fps_den);
 
+    for (unsigned i = 0; i < N_WORKERS; i++) {
+        worker_queue_t *q = &p_sys->queues[i];
+        vlc_mutex_init(&q->lock);
+        vlc_cond_init(&q->cond_work);
+        vlc_cond_init(&q->cond_space);
+        vlc_cond_init(&q->cond_drained);
+    }
+    p_sys->b_queues_initialized = true;
+
+    for (unsigned i = 0; i < N_WORKERS; i++) {
+        p_sys->worker_ctx[i].p_demux = p_demux;
+        p_sys->worker_ctx[i].idx = i;
+        if (vlc_clone(&p_sys->worker_threads[i], WorkerThread, &p_sys->worker_ctx[i],
+                      VLC_THREAD_PRIORITY_INPUT)) {
+            msg_Err(p_demux, "st2110: failed to spawn worker thread %u", i);
+            goto error;
+        }
+        p_sys->n_workers_started++;
+    }
+
     if (vlc_clone(&p_sys->thread, ReceiveThread, p_demux, VLC_THREAD_PRIORITY_INPUT)) {
         msg_Err(p_demux, "st2110: failed to spawn receive thread");
         goto error;
@@ -665,10 +859,33 @@ static void Close(vlc_object_t *obj)
     if (!p_sys)
         return;
 
+    /* Stop the producer first so no more work gets enqueued, then let the
+       workers drain out and shut down. */
     if (p_sys->b_thread_started) {
         vlc_cancel(p_sys->thread);
         vlc_join(p_sys->thread, NULL);
     }
+
+    if (p_sys->b_queues_initialized) {
+        for (unsigned i = 0; i < p_sys->n_workers_started; i++) {
+            worker_queue_t *q = &p_sys->queues[i];
+            vlc_mutex_lock(&q->lock);
+            q->b_shutdown = true;
+            vlc_cond_broadcast(&q->cond_work);
+            vlc_mutex_unlock(&q->lock);
+        }
+        for (unsigned i = 0; i < p_sys->n_workers_started; i++)
+            vlc_join(p_sys->worker_threads[i], NULL);
+
+        for (unsigned i = 0; i < N_WORKERS; i++) {
+            worker_queue_t *q = &p_sys->queues[i];
+            vlc_mutex_destroy(&q->lock);
+            vlc_cond_destroy(&q->cond_work);
+            vlc_cond_destroy(&q->cond_space);
+            vlc_cond_destroy(&q->cond_drained);
+        }
+    }
+
     if (p_sys->fd != -1)
         net_Close(p_sys->fd);
 

@@ -29,9 +29,13 @@ Then tick "Use custom 10bit receiver" in the Lua extension's dialog before press
 
 Interlaced ST 2110-20 (F bit / per-field line numbers) is supported by weaving both fields into one picture buffer. The module auto-detects, per sender, whether SRD line numbers follow the ST2110-20 spec (zero-based) or the SDI-legacy raw-raster convention some IP gateways emit instead — no user configuration needed for that part. None of this has been validated against a real interlaced sender yet.
 
-## Status
+## Troubleshooting: playback opens but nothing plays
 
-This is a from-scratch rebuild (2026-08). Live RTP/SDP playback was previously observed to never start on one test machine even with VLC's own stock RTP demuxer and no custom code involved at all — a VLC-installation/environment issue, not a bug in this project's code. That investigation was parked; if live playback still doesn't start after installing these plugins, first confirm plain `rtp://` or `.sdp` playback works in your VLC build before suspecting this code.
+If VLC logs show the SDP being opened successfully (`` `file://...sdp' successfully opened ``) and then immediately tearing back down (`incoming request - stopping current input` / `dead input` / `nothing to play`) with no audio or video ever appearing, check **Windows Defender Firewall** first. On a freshly-connected PC, Windows often defaults the NIC to the "Public" network profile, which blocks unsolicited inbound UDP — including multicast RTP — even though NIC-level bandwidth counters still show traffic (IGMP join / switch forwarding happens below the firewall layer, so bandwidth showing up does *not* rule this out).
+
+To check/fix:
+1. `Get-NetConnectionProfile` in PowerShell — if `NetworkCategory` is `Public`, that's the likely cause; broadcast networks should generally be `Private`.
+2. Quick isolation test: temporarily turn Windows Defender Firewall off entirely and retry — if playback starts working, this was it. Turn it back on afterward and add a proper inbound allow rule (for VLC, or for the relevant UDP ports) instead of leaving it off.
 
 ## CI
 
