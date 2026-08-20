@@ -66,6 +66,31 @@
 #define QUEUE_SLOTS  32
 #define BATCH_SIZE   16
 
+#ifdef _WIN32
+/*
+ * On Windows, a poll()+recv() loop pays a full syscall pair per UDP
+ * datagram; at the ~80k-140k pkts/sec a live uncompressed HD feed produces,
+ * that alone can saturate a core independent of the actual unpack work
+ * (confirmed: parallelizing the unpack work across worker threads did not
+ * relieve the receive thread's own core). This is the same problem
+ * high-performance packet capture (Npcap/WinPcap, and Microsoft's own
+ * guidance for high-throughput network servers) solves with asynchronous,
+ * batched I/O instead of one blocking call per packet: pre-post many
+ * overlapped WSARecv buffers, and retrieve completions in bulk via
+ * GetQueuedCompletionStatusEx(), which can dequeue MANY finished receives
+ * in a single call instead of one syscall per packet.
+ */
+# define IOCP_BUFFER_COUNT      64  /* overlapped receives kept in flight  */
+# define IOCP_MAX_COMPLETIONS   64  /* drained per GetQueuedCompletionStatusEx call */
+
+typedef struct {
+    OVERLAPPED overlapped;
+    WSABUF     wsabuf;
+    DWORD      flags;
+    uint8_t    data[RECV_BUF_LEN];
+} iocp_buf_t;
+#endif
+
 /*
  * SMPTE ST 2110-20:2017 6.1.5 defines the SRD Line No as zero-based. In
  * practice, some real SDI-to-IP gateways instead emit the SDI-legacy raw
@@ -183,6 +208,19 @@ struct demux_sys_t
     /* receive thread */
     vlc_thread_t thread;
     bool         b_thread_started;
+    /* Cooperative shutdown signal for the Windows IOCP receive path: a
+       blocked GetQueuedCompletionStatusEx() is not necessarily a
+       vlc_cancel() cancellation point the way vlc_poll() is, so Close()
+       sets this before cancelling and the receive loop checks it on every
+       wakeup (at least once/sec, via the call's timeout) as a bounded-time
+       fallback -- this must never be able to hang the way the old
+       select()-based design once did. */
+    atomic_bool  b_stop_requested;
+
+#ifdef _WIN32
+    HANDLE     iocp;
+    iocp_buf_t iocp_bufs[IOCP_BUFFER_COUNT];
+#endif
 
     /* pixel-unpack worker pool (see WriteLines/WorkerThread) */
     worker_queue_t queues[N_WORKERS];
@@ -623,12 +661,171 @@ static void FinalizeFrame(demux_t *p_demux, demux_sys_t *p_sys)
     p_sys->i_drop_line_range = p_sys->i_drop_stride = 0;
 }
 
-/* Dedicated receive thread. VLC's own RTP module (modules/access/rtp/rtp.c)
- * uses this same pattern for live network sources: pf_demux is left NULL and
- * a vlc_clone()'d thread pushes blocks to es_out asynchronously, rather than
- * the core polling pf_demux. poll() here resolves to vlc_poll() (see
- * vlc_threads.h), which is VLC's cancellation-aware wrapper -- raw select()
- * has no such wrapper and would make Close()'s vlc_join() hang forever. */
+/* Parses one packet and feeds it into the frame-accumulation state machine:
+ * line-mode detection, interlace field-boundary tracking (RTP timestamp
+ * based -- see the comment inline below), batched dispatch to the worker
+ * pool, and finalizing a frame when it's complete. Shared by every
+ * platform's packet-acquisition loop below. */
+static void ProcessPacket(demux_t *p_demux, demux_sys_t *p_sys, batch_state_t *batch,
+                           const uint8_t *pkt, size_t len)
+{
+    unsigned hdr_len;
+    uint32_t ts;
+    bool marker;
+    if (ParseRTP(pkt, len, &hdr_len, &ts, &marker) != 0) {
+        p_sys->i_pkts_rtp_fail++;
+        return;
+    }
+
+    const uint8_t *payload = pkt + hdr_len;
+    size_t payload_len = len - hdr_len;
+    if (payload_len < RFC4175_EXT_SEQ_LEN) {
+        p_sys->i_pkts_line_fail++;
+        return;
+    }
+    payload += RFC4175_EXT_SEQ_LEN;
+    payload_len -= RFC4175_EXT_SEQ_LEN;
+
+    rfc4175_line_hdr_t hdrs[MAX_LINE_SEGMENTS];
+    unsigned n_hdrs;
+    size_t hdr_bytes;
+    if (ParseLineHeaders(payload, payload_len, hdrs, MAX_LINE_SEGMENTS,
+                          &n_hdrs, &hdr_bytes) != 0) {
+        p_sys->i_pkts_line_fail++;
+        return;
+    }
+
+    DetectLineMode(p_demux, p_sys, hdrs, n_hdrs);
+
+    if (p_sys->b_interlace) {
+        /* Field/frame boundaries are delimited by RTP timestamp changes
+           (RFC4175: every packet of one field shares one timestamp), not
+           by the marker bit -- a lost or reordered marker packet must not
+           be able to desync the field count. Two distinct timestamps =
+           one complete interlaced frame (field one, field two); the third
+           distinct timestamp means the next frame has started, so
+           finalize before folding its data in. */
+        if (!p_sys->b_accum_started) {
+            p_sys->b_accum_started = true;
+            p_sys->i_accum_ts = ts;
+            p_sys->i_field_count = 1;
+        } else if (ts != p_sys->i_accum_ts) {
+            p_sys->i_accum_ts = ts;
+            p_sys->i_field_count++;
+            if (p_sys->i_field_count > 2) {
+                /* This packet belongs to the new field/frame, so it must
+                   not be in the batch being flushed here. */
+                FlushBatch(batch);
+                DrainAllWorkers(p_sys);
+                FinalizeFrame(p_demux, p_sys);
+                p_sys->i_field_count = 1;
+            }
+        }
+        AddToBatch(p_sys, batch, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
+    } else {
+        AddToBatch(p_sys, batch, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
+        if (marker) {
+            /* This packet (the frame's last) must be included. */
+            FlushBatch(batch);
+            DrainAllWorkers(p_sys);
+            FinalizeFrame(p_demux, p_sys);
+        }
+    }
+}
+
+static void CheckStatsWindow(demux_t *p_demux, demux_sys_t *p_sys)
+{
+    if (mdate() - p_sys->i_stat_window_start <= 5 * CLOCK_FREQ)
+        return;
+    if (p_sys->i_pkts_rtp_fail || p_sys->i_pkts_line_fail || p_sys->i_pkts_no_frame)
+        msg_Warn(p_demux, "st2110: pkts=%u rtp_fail=%u line_fail=%u no_frame=%u",
+                 p_sys->i_pkts_total, p_sys->i_pkts_rtp_fail,
+                 p_sys->i_pkts_line_fail, p_sys->i_pkts_no_frame);
+    p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = 0;
+    p_sys->i_pkts_line_fail = p_sys->i_pkts_no_frame = 0;
+    p_sys->i_idle_polls = 0;
+    p_sys->i_stat_window_start = mdate();
+}
+
+#ifdef _WIN32
+/* Windows receive thread: asynchronous, batched I/O via IOCP instead of a
+ * blocking-call-per-packet model (see the IOCP_BUFFER_COUNT comment above
+ * for why). Many overlapped WSARecv()s are kept in flight at once; each
+ * wakeup can harvest many finished ones via GetQueuedCompletionStatusEx().
+ *
+ * The alertable wait (last arg TRUE) lets vlc_cancel()'s APC interrupt a
+ * blocked wait if VLC's Windows thread implementation delivers it that
+ * way -- but that isn't relied on for correctness: b_stop_requested plus
+ * the 1000ms timeout is a bounded-time fallback that guarantees this loop
+ * exits on its own, so Close()'s vlc_join() can never hang the way it did
+ * with the old select()-based design. */
+static void *ReceiveThread(void *data)
+{
+    demux_t *p_demux = data;
+    demux_sys_t *p_sys = p_demux->p_sys;
+    batch_state_t batch = { NULL, NULL, 0 };
+    OVERLAPPED_ENTRY entries[IOCP_MAX_COMPLETIONS];
+
+    p_sys->i_stat_window_start = mdate();
+
+    for (;;) {
+        if (atomic_load(&p_sys->b_stop_requested))
+            break;
+
+        ULONG n = 0;
+        BOOL ok = GetQueuedCompletionStatusEx(p_sys->iocp, entries,
+                                               IOCP_MAX_COMPLETIONS, &n, 1000, TRUE);
+        int canc = vlc_savecancel();
+
+        if (!ok) {
+            DWORD err = GetLastError();
+            if (err == WAIT_TIMEOUT) {
+                p_sys->i_idle_polls++;
+                if (p_sys->i_idle_polls % 10 == 0)
+                    msg_Warn(p_demux, "st2110: no data received for ~%us", p_sys->i_idle_polls);
+            } else if (err != WAIT_IO_COMPLETION) {
+                /* IOCP handle gone or another fatal error */
+                vlc_restorecancel(canc);
+                break;
+            }
+            vlc_restorecancel(canc);
+            continue;
+        }
+
+        for (ULONG e = 0; e < n; e++) {
+            iocp_buf_t *b = (iocp_buf_t *)CONTAINING_RECORD(entries[e].lpOverlapped,
+                                                              iocp_buf_t, overlapped);
+            DWORD xfer = entries[e].dwNumberOfBytesTransferred;
+
+            if (xfer > 0) {
+                p_sys->i_pkts_total++;
+                ProcessPacket(p_demux, p_sys, &batch, b->data, (size_t)xfer);
+            }
+
+            if (!atomic_load(&p_sys->b_stop_requested)) {
+                b->wsabuf.buf = (char *)b->data;
+                b->wsabuf.len = RECV_BUF_LEN;
+                b->flags = 0;
+                memset(&b->overlapped, 0, sizeof(b->overlapped));
+                int r = WSARecv((SOCKET)p_sys->fd, &b->wsabuf, 1, NULL, &b->flags,
+                                 &b->overlapped, NULL);
+                if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
+                    msg_Warn(p_demux, "st2110: WSARecv repost failed (err=%d)", WSAGetLastError());
+            }
+        }
+
+        CheckStatsWindow(p_demux, p_sys);
+        FlushBatch(&batch);
+        vlc_restorecancel(canc);
+    }
+
+    return NULL;
+}
+#else
+/* POSIX receive thread. poll() here resolves to vlc_poll() (see
+ * vlc_threads.h), which is VLC's cancellation-aware wrapper -- raw
+ * select() has no such wrapper and would make Close()'s vlc_join() hang
+ * forever. */
 static void *ReceiveThread(void *data)
 {
     demux_t *p_demux = data;
@@ -668,91 +865,13 @@ static void *ReceiveThread(void *data)
         for (;;) {
             ssize_t len = recv(p_sys->fd, (char *)pkt, sizeof(pkt), 0);
             if (len <= 0) {
-#ifdef _WIN32
-                if (len < 0 && WSAGetLastError() == WSAEWOULDBLOCK)
-                    break;
-#else
                 if (len < 0 && (errno == EWOULDBLOCK || errno == EAGAIN))
                     break;
-#endif
                 break; /* real error or 0-length packet: stop this burst */
             }
             p_sys->i_pkts_total++;
-
-            unsigned hdr_len;
-            uint32_t ts;
-            bool marker;
-            if (ParseRTP(pkt, (size_t)len, &hdr_len, &ts, &marker) != 0) {
-                p_sys->i_pkts_rtp_fail++;
-                continue;
-            }
-
-            const uint8_t *payload = pkt + hdr_len;
-            size_t payload_len = (size_t)len - hdr_len;
-            if (payload_len < RFC4175_EXT_SEQ_LEN) {
-                p_sys->i_pkts_line_fail++;
-                continue;
-            }
-            payload += RFC4175_EXT_SEQ_LEN;
-            payload_len -= RFC4175_EXT_SEQ_LEN;
-
-            rfc4175_line_hdr_t hdrs[MAX_LINE_SEGMENTS];
-            unsigned n_hdrs;
-            size_t hdr_bytes;
-            if (ParseLineHeaders(payload, payload_len, hdrs, MAX_LINE_SEGMENTS,
-                                  &n_hdrs, &hdr_bytes) != 0) {
-                p_sys->i_pkts_line_fail++;
-                continue;
-            }
-
-            DetectLineMode(p_demux, p_sys, hdrs, n_hdrs);
-
-            if (p_sys->b_interlace) {
-                /* Field/frame boundaries are delimited by RTP timestamp
-                   changes (RFC4175: every packet of one field shares one
-                   timestamp), not by the marker bit -- a lost or reordered
-                   marker packet must not be able to desync the field
-                   count. Two distinct timestamps = one complete interlaced
-                   frame (field one, field two); the third distinct
-                   timestamp means the next frame has started, so finalize
-                   before folding its data in. */
-                if (!p_sys->b_accum_started) {
-                    p_sys->b_accum_started = true;
-                    p_sys->i_accum_ts = ts;
-                    p_sys->i_field_count = 1;
-                } else if (ts != p_sys->i_accum_ts) {
-                    p_sys->i_accum_ts = ts;
-                    p_sys->i_field_count++;
-                    if (p_sys->i_field_count > 2) {
-                        /* This packet belongs to the new field/frame, so it
-                           must not be in the batch being flushed here. */
-                        FlushBatch(&batch);
-                        DrainAllWorkers(p_sys);
-                        FinalizeFrame(p_demux, p_sys);
-                        p_sys->i_field_count = 1;
-                    }
-                }
-                AddToBatch(p_sys, &batch, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
-            } else {
-                AddToBatch(p_sys, &batch, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
-                if (marker) {
-                    /* This packet (the frame's last) must be included. */
-                    FlushBatch(&batch);
-                    DrainAllWorkers(p_sys);
-                    FinalizeFrame(p_demux, p_sys);
-                }
-            }
-
-            if (mdate() - p_sys->i_stat_window_start > 5 * CLOCK_FREQ) {
-                if (p_sys->i_pkts_rtp_fail || p_sys->i_pkts_line_fail || p_sys->i_pkts_no_frame)
-                    msg_Warn(p_demux, "st2110: pkts=%u rtp_fail=%u line_fail=%u no_frame=%u",
-                             p_sys->i_pkts_total, p_sys->i_pkts_rtp_fail,
-                             p_sys->i_pkts_line_fail, p_sys->i_pkts_no_frame);
-                p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = 0;
-                p_sys->i_pkts_line_fail = p_sys->i_pkts_no_frame = 0;
-                p_sys->i_idle_polls = 0;
-                p_sys->i_stat_window_start = mdate();
-            }
+            ProcessPacket(p_demux, p_sys, &batch, pkt, (size_t)len);
+            CheckStatsWindow(p_demux, p_sys);
         }
 
         /* Don't let a partial batch sit un-dispatched until the next burst
@@ -765,6 +884,7 @@ static void *ReceiveThread(void *data)
 
     return NULL;
 }
+#endif
 
 static int Control(demux_t *p_demux, int query, va_list args)
 {
@@ -856,14 +976,37 @@ static int Open(vlc_object_t *obj)
     int rcvbuf = SO_RCVBUF_SIZE;
     setsockopt(p_sys->fd, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
 
-    /* Non-blocking: ReceiveThread uses poll() only to wait for the first
-       packet of a burst, then drains everything already queued with plain
-       recv() calls before going back to poll() -- at ~80k+ pkts/sec on a
-       live HD feed, paying poll()'s syscall cost per packet instead of per
-       burst is itself enough to peg a core. */
 #ifdef _WIN32
-    { u_long mode = 1; ioctlsocket(p_sys->fd, FIONBIO, &mode); }
+    /* Set up IOCP-based asynchronous receive (see the ReceiveThread comment
+       for why): associate the socket with a completion port, then keep
+       IOCP_BUFFER_COUNT overlapped WSARecv()s in flight at all times. */
+    p_sys->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    if (!p_sys->iocp) {
+        msg_Err(p_demux, "st2110: CreateIoCompletionPort failed (err=%lu)", GetLastError());
+        goto error;
+    }
+    if (!CreateIoCompletionPort((HANDLE)(uintptr_t)(SOCKET)p_sys->fd, p_sys->iocp, 0, 0)) {
+        msg_Err(p_demux, "st2110: failed to associate socket with IOCP (err=%lu)", GetLastError());
+        goto error;
+    }
+    for (unsigned i = 0; i < IOCP_BUFFER_COUNT; i++) {
+        iocp_buf_t *b = &p_sys->iocp_bufs[i];
+        memset(&b->overlapped, 0, sizeof(b->overlapped));
+        b->wsabuf.buf = (char *)b->data;
+        b->wsabuf.len = RECV_BUF_LEN;
+        b->flags = 0;
+        int r = WSARecv((SOCKET)p_sys->fd, &b->wsabuf, 1, NULL, &b->flags, &b->overlapped, NULL);
+        if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
+            msg_Err(p_demux, "st2110: WSARecv failed to post buffer %u (err=%d)", i, WSAGetLastError());
+            goto error;
+        }
+    }
 #else
+    /* ReceiveThread uses poll() only to wait for the first packet of a
+       burst, then drains everything already queued with plain recv()
+       calls before going back to poll() -- at ~80k+ pkts/sec on a live HD
+       feed, paying poll()'s syscall cost per packet instead of per burst
+       is itself enough to peg a core. */
     { int flags = fcntl(p_sys->fd, F_GETFL, 0); fcntl(p_sys->fd, F_SETFL, flags | O_NONBLOCK); }
 #endif
 
@@ -942,10 +1085,29 @@ static void Close(vlc_object_t *obj)
 
     /* Stop the producer first so no more work gets enqueued, then let the
        workers drain out and shut down. */
+    atomic_store(&p_sys->b_stop_requested, true);
     if (p_sys->b_thread_started) {
         vlc_cancel(p_sys->thread);
         vlc_join(p_sys->thread, NULL);
     }
+
+#ifdef _WIN32
+    if (p_sys->iocp) {
+        /* Cancel and drain any WSARecv()s still outstanding against our
+           buffers before freeing them below -- ReceiveThread has already
+           exited by this point (joined above), so nothing will observe
+           these completions; this purely ensures the OS is done writing
+           into iocp_bufs before free(p_sys) reclaims that memory. */
+        if (p_sys->fd != -1)
+            CancelIoEx((HANDLE)(uintptr_t)(SOCKET)p_sys->fd, NULL);
+        OVERLAPPED_ENTRY drain[IOCP_BUFFER_COUNT];
+        ULONG n;
+        while (GetQueuedCompletionStatusEx(p_sys->iocp, drain, IOCP_BUFFER_COUNT, &n, 0, FALSE) && n > 0)
+            ; /* discard */
+        CloseHandle(p_sys->iocp);
+        p_sys->iocp = NULL;
+    }
+#endif
 
     if (p_sys->b_queues_initialized) {
         for (unsigned i = 0; i < p_sys->n_workers_started; i++) {
