@@ -39,6 +39,7 @@
 
 #ifndef _WIN32
 # include <poll.h>
+# include <fcntl.h>
 #endif
 
 /* ---- RFC 4175 / RTP constants ---- */
@@ -610,83 +611,94 @@ static void *ReceiveThread(void *data)
             continue;
         }
 
-        ssize_t len = recv(p_sys->fd, (char *)pkt, sizeof(pkt), 0);
-        if (len <= 0) {
-            vlc_restorecancel(canc);
-            continue;
-        }
-        p_sys->i_pkts_total++;
+        /* Drain every packet already queued by the kernel before going
+           back to poll(): at high packet rates several are typically
+           waiting by the time poll() wakes us, and processing them all
+           here amortizes poll()'s syscall cost across the whole burst
+           instead of paying it once per packet. */
+        for (;;) {
+            ssize_t len = recv(p_sys->fd, (char *)pkt, sizeof(pkt), 0);
+            if (len <= 0) {
+#ifdef _WIN32
+                if (len < 0 && WSAGetLastError() == WSAEWOULDBLOCK)
+                    break;
+#else
+                if (len < 0 && (errno == EWOULDBLOCK || errno == EAGAIN))
+                    break;
+#endif
+                break; /* real error or 0-length packet: stop this burst */
+            }
+            p_sys->i_pkts_total++;
 
-        unsigned hdr_len;
-        uint32_t ts;
-        bool marker;
-        if (ParseRTP(pkt, (size_t)len, &hdr_len, &ts, &marker) != 0) {
-            p_sys->i_pkts_rtp_fail++;
-            vlc_restorecancel(canc);
-            continue;
-        }
+            unsigned hdr_len;
+            uint32_t ts;
+            bool marker;
+            if (ParseRTP(pkt, (size_t)len, &hdr_len, &ts, &marker) != 0) {
+                p_sys->i_pkts_rtp_fail++;
+                continue;
+            }
 
-        const uint8_t *payload = pkt + hdr_len;
-        size_t payload_len = (size_t)len - hdr_len;
-        if (payload_len < RFC4175_EXT_SEQ_LEN) {
-            p_sys->i_pkts_line_fail++;
-            vlc_restorecancel(canc);
-            continue;
-        }
-        payload += RFC4175_EXT_SEQ_LEN;
-        payload_len -= RFC4175_EXT_SEQ_LEN;
+            const uint8_t *payload = pkt + hdr_len;
+            size_t payload_len = (size_t)len - hdr_len;
+            if (payload_len < RFC4175_EXT_SEQ_LEN) {
+                p_sys->i_pkts_line_fail++;
+                continue;
+            }
+            payload += RFC4175_EXT_SEQ_LEN;
+            payload_len -= RFC4175_EXT_SEQ_LEN;
 
-        rfc4175_line_hdr_t hdrs[MAX_LINE_SEGMENTS];
-        unsigned n_hdrs;
-        size_t hdr_bytes;
-        if (ParseLineHeaders(payload, payload_len, hdrs, MAX_LINE_SEGMENTS,
-                              &n_hdrs, &hdr_bytes) != 0) {
-            p_sys->i_pkts_line_fail++;
-            vlc_restorecancel(canc);
-            continue;
-        }
+            rfc4175_line_hdr_t hdrs[MAX_LINE_SEGMENTS];
+            unsigned n_hdrs;
+            size_t hdr_bytes;
+            if (ParseLineHeaders(payload, payload_len, hdrs, MAX_LINE_SEGMENTS,
+                                  &n_hdrs, &hdr_bytes) != 0) {
+                p_sys->i_pkts_line_fail++;
+                continue;
+            }
 
-        DetectLineMode(p_demux, p_sys, hdrs, n_hdrs);
+            DetectLineMode(p_demux, p_sys, hdrs, n_hdrs);
 
-        if (p_sys->b_interlace) {
-            /* Field/frame boundaries are delimited by RTP timestamp changes
-               (RFC4175: every packet of one field shares one timestamp),
-               not by the marker bit -- a lost or reordered marker packet
-               must not be able to desync the field count. Two distinct
-               timestamps = one complete interlaced frame (field one, field
-               two); the third distinct timestamp means the next frame has
-               started, so finalize before folding its data in. */
-            if (!p_sys->b_accum_started) {
-                p_sys->b_accum_started = true;
-                p_sys->i_accum_ts = ts;
-                p_sys->i_field_count = 1;
-            } else if (ts != p_sys->i_accum_ts) {
-                p_sys->i_accum_ts = ts;
-                p_sys->i_field_count++;
-                if (p_sys->i_field_count > 2) {
-                    DrainAllWorkers(p_sys);   /* wait out the field just finished */
-                    FinalizeFrame(p_demux, p_sys);
+            if (p_sys->b_interlace) {
+                /* Field/frame boundaries are delimited by RTP timestamp
+                   changes (RFC4175: every packet of one field shares one
+                   timestamp), not by the marker bit -- a lost or reordered
+                   marker packet must not be able to desync the field
+                   count. Two distinct timestamps = one complete interlaced
+                   frame (field one, field two); the third distinct
+                   timestamp means the next frame has started, so finalize
+                   before folding its data in. */
+                if (!p_sys->b_accum_started) {
+                    p_sys->b_accum_started = true;
+                    p_sys->i_accum_ts = ts;
                     p_sys->i_field_count = 1;
+                } else if (ts != p_sys->i_accum_ts) {
+                    p_sys->i_accum_ts = ts;
+                    p_sys->i_field_count++;
+                    if (p_sys->i_field_count > 2) {
+                        DrainAllWorkers(p_sys);   /* wait out the field just finished */
+                        FinalizeFrame(p_demux, p_sys);
+                        p_sys->i_field_count = 1;
+                    }
+                }
+                DispatchWork(p_sys, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
+            } else {
+                DispatchWork(p_sys, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
+                if (marker) {
+                    DrainAllWorkers(p_sys);
+                    FinalizeFrame(p_demux, p_sys);
                 }
             }
-            DispatchWork(p_sys, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
-        } else {
-            DispatchWork(p_sys, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
-            if (marker) {
-                DrainAllWorkers(p_sys);
-                FinalizeFrame(p_demux, p_sys);
-            }
-        }
 
-        if (mdate() - p_sys->i_stat_window_start > 5 * CLOCK_FREQ) {
-            if (p_sys->i_pkts_rtp_fail || p_sys->i_pkts_line_fail || p_sys->i_pkts_no_frame)
-                msg_Warn(p_demux, "st2110: pkts=%u rtp_fail=%u line_fail=%u no_frame=%u",
-                         p_sys->i_pkts_total, p_sys->i_pkts_rtp_fail,
-                         p_sys->i_pkts_line_fail, p_sys->i_pkts_no_frame);
-            p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = 0;
-            p_sys->i_pkts_line_fail = p_sys->i_pkts_no_frame = 0;
-            p_sys->i_idle_polls = 0;
-            p_sys->i_stat_window_start = mdate();
+            if (mdate() - p_sys->i_stat_window_start > 5 * CLOCK_FREQ) {
+                if (p_sys->i_pkts_rtp_fail || p_sys->i_pkts_line_fail || p_sys->i_pkts_no_frame)
+                    msg_Warn(p_demux, "st2110: pkts=%u rtp_fail=%u line_fail=%u no_frame=%u",
+                             p_sys->i_pkts_total, p_sys->i_pkts_rtp_fail,
+                             p_sys->i_pkts_line_fail, p_sys->i_pkts_no_frame);
+                p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = 0;
+                p_sys->i_pkts_line_fail = p_sys->i_pkts_no_frame = 0;
+                p_sys->i_idle_polls = 0;
+                p_sys->i_stat_window_start = mdate();
+            }
         }
 
         vlc_restorecancel(canc);
@@ -784,6 +796,17 @@ static int Open(vlc_object_t *obj)
     }
     int rcvbuf = SO_RCVBUF_SIZE;
     setsockopt(p_sys->fd, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
+
+    /* Non-blocking: ReceiveThread uses poll() only to wait for the first
+       packet of a burst, then drains everything already queued with plain
+       recv() calls before going back to poll() -- at ~80k+ pkts/sec on a
+       live HD feed, paying poll()'s syscall cost per packet instead of per
+       burst is itself enough to peg a core. */
+#ifdef _WIN32
+    { u_long mode = 1; ioctlsocket(p_sys->fd, FIONBIO, &mode); }
+#else
+    { int flags = fcntl(p_sys->fd, F_GETFL, 0); fcntl(p_sys->fd, F_SETFL, flags | O_NONBLOCK); }
+#endif
 
     p_sys->i_y_plane_size  = (size_t)p_sys->i_width * p_sys->i_height * 2;
     p_sys->i_uv_plane_size = (size_t)(p_sys->i_width / 2) * p_sys->i_height * 2;
