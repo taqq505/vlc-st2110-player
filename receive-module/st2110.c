@@ -25,6 +25,7 @@
 #else
 # include <sys/socket.h>
 # include <netinet/in.h>
+# include <sys/select.h>
 #endif
 
 #include <vlc_common.h>
@@ -34,15 +35,13 @@
 #include <vlc_block.h>
 #include <vlc_es.h>
 #include <vlc_fourcc.h>
+#include <vlc_interrupt.h>
 
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
-# include <errno.h>
-#endif
 
 static int  Open(vlc_object_t *);
 static void Close(vlc_object_t *);
@@ -107,7 +106,7 @@ struct demux_sys_t
      * (zero packets); logged on its own timer, see Demux(). Broken down by
      * pipeline stage so a systematic parse failure (which would silently
      * `continue` before ever reaching the old single counter) is visible
-     * too -- every net_Read'd packet is accounted for somewhere. */
+     * too -- every received packet is accounted for somewhere. */
     unsigned i_pkts_total;
     unsigned i_pkts_rtp_fail;
     unsigned i_pkts_line_fail;
@@ -492,7 +491,7 @@ static block_t *FinalizeFrame(demux_t *p_demux)
  * access_demux module st2110" -- this build has repeatedly been debugged
  * against stale .dll copies, so this removes all doubt about which build
  * is actually running. */
-#define ST2110_BUILD_MARKER "st2110 build: auto-detect-lineno(zero-based+sdi-legacy)+pace-fix+staged-diag"
+#define ST2110_BUILD_MARKER "st2110 build: auto-detect-lineno+pace-fix+select-recv-io"
 
 static int Open(vlc_object_t *p_this)
 {
@@ -582,21 +581,8 @@ static int Open(vlc_object_t *p_this)
         int i_rcvbuf = 32 * 1024 * 1024;
         setsockopt(p_sys->fd, SOL_SOCKET, SO_RCVBUF, (const char *)&i_rcvbuf, sizeof(i_rcvbuf));
     }
-    /* Without a receive timeout, Demux() blocks in net_Read forever if no
-     * packets ever arrive (wrong SSM source, no PIM-SSM route to this host,
-     * a firewall, ...) with zero visibility into why. Timing out lets
-     * Demux() log periodic diagnostics instead of just sitting silent. */
-#ifdef _WIN32
-    {
-        DWORD timeout_ms = 2000;
-        setsockopt(p_sys->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
-    }
-#else
-    {
-        struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
-        setsockopt(p_sys->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
-    }
-#endif
+    /* No SO_RCVTIMEO here: Demux() times out receive waits itself via
+     * select(), which needs no socket-level timeout configured. */
 
     p_sys->i_stride_packed = (size_t)(p_sys->i_width / 2) * 5;
     p_sys->i_buf_size      = p_sys->i_stride_packed * (size_t)p_sys->i_height;
@@ -658,21 +644,20 @@ static void Close(vlc_object_t *p_this)
     p_demux->p_sys = NULL;
 }
 
-/* True if the last socket call failed merely because SO_RCVTIMEO elapsed
- * with no data (i.e. not a real error). */
-static bool LastRecvTimedOut(void)
-{
-#ifdef _WIN32
-    int e = WSAGetLastError();
-    return e == WSAETIMEDOUT || e == WSAEWOULDBLOCK;
-#else
-    return errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT;
-#endif
-}
-
 /* Reads packets until one full frame is assembled (marker bit), or a
  * timestamp change reveals that the previous frame's marker was lost, then
- * sends exactly one block and returns -- per spec §5.3. */
+ * sends exactly one block and returns -- per spec §5.3.
+ *
+ * Owns the socket I/O directly (select() then recv()) instead of going
+ * through net_Read(): net_Read() wraps VLC's own interruptible-blocking-
+ * call machinery, and an earlier version of this function relied on
+ * SO_RCVTIMEO plus net_Read()'s own timeout handling for its diagnostics --
+ * without ever confirming that machinery actually honors SO_RCVTIMEO rather
+ * than blocking indefinitely on its own. select()'s timeout is a plain OS
+ * primitive with no such uncertainty, so using it directly, with recv() to
+ * match, is both simpler than mixing two I/O layers and removes that doubt
+ * entirely. Since bypassing net_Read() also bypasses VLC's own interruption
+ * handling, this checks vlc_killed() itself each time around. */
 static int Demux(demux_t *p_demux)
 {
     demux_sys_t *p_sys = p_demux->p_sys;
@@ -680,25 +665,45 @@ static int Demux(demux_t *p_demux)
 
     for (;;)
     {
-        ssize_t n = net_Read(VLC_OBJECT(p_demux), p_sys->fd, pkt, sizeof(pkt));
+        /* select() (and our own recv() below) are not interruption-aware,
+         * so while nothing is arriving we would otherwise never notice a
+         * Stop request; check explicitly each time we come back from a
+         * timeout. */
+        if (vlc_killed())
+            return VLC_DEMUXER_EGENERIC;
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(p_sys->fd, &rfds);
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        int r = select(p_sys->fd + 1, &rfds, NULL, NULL, &tv);
+
+        if (r == 0)
+        {
+            p_sys->i_idle_polls++;
+            /* log roughly every 10s of total silence, not every 1s poll,
+             * to stay well clear of the message-flood failure mode this
+             * module hit before (see WriteLines). */
+            if (p_sys->i_idle_polls % 10 == 1)
+                msg_Warn(p_demux, "no data received in %us on %s:%d (SSM source \"%s\") "
+                          "-- check multicast routing/PIM-SSM reachability from this host",
+                          p_sys->i_idle_polls, p_sys->psz_group, p_sys->i_port,
+                          (p_sys->psz_source && *p_sys->psz_source) ? p_sys->psz_source : "(none/ASM)");
+            continue;
+        }
+        if (r < 0)
+            return VLC_DEMUXER_EGENERIC; /* socket error, or object interrupted (e.g. Stop) */
+
+        p_sys->i_idle_polls = 0;
+
+        ssize_t n = recv(p_sys->fd, (char *)pkt, sizeof(pkt), 0);
         if (n < 0)
         {
-            if (LastRecvTimedOut())
-            {
-                p_sys->i_idle_polls++;
-                /* SO_RCVTIMEO is 2s; log roughly every 10s of total silence,
-                 * not every timeout, to stay well clear of the message-flood
-                 * failure mode this module hit before (see WriteLines). */
-                if (p_sys->i_idle_polls % 5 == 1)
-                    msg_Warn(p_demux, "no data received in %us on %s:%d (SSM source \"%s\") "
-                              "-- check multicast routing/PIM-SSM reachability from this host",
-                              p_sys->i_idle_polls * 2, p_sys->psz_group, p_sys->i_port,
-                              (p_sys->psz_source && *p_sys->psz_source) ? p_sys->psz_source : "(none/ASM)");
-                continue;
-            }
+            /* select() said readable but the actual read still failed: a
+             * genuine socket error, not a timeout (select() already owns
+             * all timeout handling above). */
             return VLC_DEMUXER_EGENERIC;
         }
-        p_sys->i_idle_polls = 0;
         if (n == 0)
             continue;
 
@@ -723,7 +728,7 @@ static int Demux(demux_t *p_demux)
         if (lines_ok)
             p_sys->i_pkts_no_frame++;
 
-        /* Every net_Read'd packet is now accounted for in exactly one of
+        /* Every received packet is now accounted for in exactly one of
          * these counters (or a completed frame reset them all -- see the
          * es_out_Send call sites below), so this fires every ~5s no matter
          * which stage is actually the problem: silently discarding packets

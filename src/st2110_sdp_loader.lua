@@ -358,7 +358,12 @@ function play()
     table.insert(labels, "audio(SRC)")
   end
 
-  local opts = { ":network-caching=" .. math.floor(caching_ms), ":audio-resampler=soxr" }
+  -- :audio-resampler=soxr was forced from the start (spec §7) but whether
+  -- this VLC build actually ships the soxr module was flagged as unverified
+  -- (spec §12-5) and never actually checked. Forcing a module VLC doesn't
+  -- have could plausibly stall aout init rather than cleanly falling back.
+  -- Let VLC pick automatically instead.
+  local opts = { ":network-caching=" .. math.floor(caching_ms) }
   for _, o in ipairs(extra_opts) do table.insert(opts, o) end
   if slave_uri then table.insert(opts, ":input-slave=" .. slave_uri) end
 
