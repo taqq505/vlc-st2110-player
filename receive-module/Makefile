@@ -2,7 +2,7 @@ VLC_PLUGIN_CFLAGS := $(shell pkg-config --cflags vlc-plugin)
 VLC_PLUGIN_LIBS   := $(shell pkg-config --libs vlc-plugin)
 
 CC     ?= gcc
-CFLAGS  = -std=gnu11 -Wall -Wextra -O2 -fPIC -DPIC $(VLC_PLUGIN_CFLAGS)
+CFLAGS  = -std=gnu11 -Wall -Wextra -O2 -fPIC -DPIC -DMODULE_STRING=\"st2110\" $(VLC_PLUGIN_CFLAGS)
 LDFLAGS =
 LIBS    = $(VLC_PLUGIN_LIBS)
 
