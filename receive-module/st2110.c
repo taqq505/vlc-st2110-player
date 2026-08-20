@@ -35,7 +35,6 @@
 #include <vlc_block.h>
 #include <vlc_es.h>
 #include <vlc_fourcc.h>
-#include <vlc_interrupt.h>
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -43,10 +42,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int  Open(vlc_object_t *);
-static void Close(vlc_object_t *);
-static int  Demux(demux_t *);
-static int  Control(demux_t *, int, va_list);
+static int   Open(vlc_object_t *);
+static void  Close(vlc_object_t *);
+static void *ReceiveThread(void *);
+static int   Control(demux_t *, int, va_list);
 
 vlc_module_begin()
     set_shortname("ST2110")
@@ -100,10 +99,20 @@ struct demux_sys_t
     int       i_port;
     unsigned  i_idle_polls; /* consecutive receive timeouts with zero data */
 
+    /* receive thread: modules/access/rtp/rtp.c (VLC's own RTP access_demux)
+     * runs its own vlc_clone()'d thread that reads the socket and calls
+     * es_out_Send() directly, rather than implementing pf_demux -- pf_demux
+     * is left NULL there, exactly like here. Live network sources don't fit
+     * the "core pulls one demux worth of data at a time" model pf_demux
+     * implies; a self-driven thread matches how VLC's own such module
+     * actually does it. */
+    vlc_thread_t thread;
+    bool         thread_ready;
+
     /* packets ARE arriving but no frame has completed yet -- e.g. the
      * marker bit is never set by this sender, or (interlace) the two
      * fields never both get marker-terminated. Distinct from i_idle_polls
-     * (zero packets); logged on its own timer, see Demux(). Broken down by
+     * (zero packets); logged on its own timer, see ReceiveThread(). Broken down by
      * pipeline stage so a systematic parse failure (which would silently
      * `continue` before ever reaching the old single counter) is visible
      * too -- every received packet is accounted for somewhere. */
@@ -491,7 +500,7 @@ static block_t *FinalizeFrame(demux_t *p_demux)
  * access_demux module st2110" -- this build has repeatedly been debugged
  * against stale .dll copies, so this removes all doubt about which build
  * is actually running. */
-#define ST2110_BUILD_MARKER "st2110 build: auto-detect-lineno+pace-fix+select-recv-io"
+#define ST2110_BUILD_MARKER "st2110 build: recv-thread-arch(no-pf_demux)+auto-detect-lineno"
 
 static int Open(vlc_object_t *p_this)
 {
@@ -581,8 +590,8 @@ static int Open(vlc_object_t *p_this)
         int i_rcvbuf = 32 * 1024 * 1024;
         setsockopt(p_sys->fd, SOL_SOCKET, SO_RCVBUF, (const char *)&i_rcvbuf, sizeof(i_rcvbuf));
     }
-    /* No SO_RCVTIMEO here: Demux() times out receive waits itself via
-     * select(), which needs no socket-level timeout configured. */
+    /* No SO_RCVTIMEO here: ReceiveThread() times out receive waits itself
+     * via select(), which needs no socket-level timeout configured. */
 
     p_sys->i_stride_packed = (size_t)(p_sys->i_width / 2) * 5;
     p_sys->i_buf_size      = p_sys->i_stride_packed * (size_t)p_sys->i_height;
@@ -613,8 +622,17 @@ static int Open(vlc_object_t *p_this)
     if (!p_sys->es)
         goto error;
 
-    p_demux->pf_demux   = Demux;
+    /* No pf_demux: ReceiveThread runs on its own and pushes to es_out_Send()
+     * directly, matching modules/access/rtp/rtp.c. */
+    p_demux->pf_demux   = NULL;
     p_demux->pf_control = Control;
+
+    if (vlc_clone(&p_sys->thread, ReceiveThread, p_demux, VLC_THREAD_PRIORITY_INPUT))
+    {
+        msg_Err(p_demux, "failed to start receive thread");
+        goto error;
+    }
+    p_sys->thread_ready = true;
 
     return VLC_SUCCESS;
 
@@ -631,6 +649,14 @@ static void Close(vlc_object_t *p_this)
     if (!p_sys)
         return;
 
+    /* Stop and join the thread before touching anything it might still be
+     * using (the socket, the frame buffer, es_out). */
+    if (p_sys->thread_ready)
+    {
+        vlc_cancel(p_sys->thread);
+        vlc_join(p_sys->thread, NULL);
+    }
+
     if (p_sys->fd >= 0)
         net_Close(p_sys->fd);
 
@@ -644,39 +670,35 @@ static void Close(vlc_object_t *p_this)
     p_demux->p_sys = NULL;
 }
 
-/* Reads packets until one full frame is assembled (marker bit), or a
- * timestamp change reveals that the previous frame's marker was lost, then
- * sends exactly one block and returns -- per spec §5.3.
+/* Runs for the lifetime of the stream (vlc_clone()'d from Open(), stopped
+ * via vlc_cancel()+vlc_join() in Close()): reads packets, and whenever one
+ * full frame is assembled (marker bit, or for progressive a timestamp
+ * change revealing the previous frame's marker was lost), pushes it with
+ * es_out_Send() directly -- there is no caller to return frames to one at a
+ * time. Matches modules/access/rtp/rtp.c's rtp_dgram_thread(): pf_demux is
+ * not used for a live network source here (see Open()).
  *
- * Owns the socket I/O directly (select() then recv()) instead of going
- * through net_Read(): net_Read() wraps VLC's own interruptible-blocking-
- * call machinery, and an earlier version of this function relied on
- * SO_RCVTIMEO plus net_Read()'s own timeout handling for its diagnostics --
- * without ever confirming that machinery actually honors SO_RCVTIMEO rather
- * than blocking indefinitely on its own. select()'s timeout is a plain OS
- * primitive with no such uncertainty, so using it directly, with recv() to
- * match, is both simpler than mixing two I/O layers and removes that doubt
- * entirely. Since bypassing net_Read() also bypasses VLC's own interruption
- * handling, this checks vlc_killed() itself each time around. */
-static int Demux(demux_t *p_demux)
+ * Owns the socket I/O directly (select() then recv()) rather than going
+ * through net_Read(), for the same reason rtp_dgram_thread() uses raw
+ * poll()+recvmsg(): a plain OS-level timeout has no VLC-internal machinery
+ * to second-guess. vlc_savecancel()/vlc_restorecancel() bracket each
+ * iteration's processing (mirroring rtp_dgram_thread()), so a pending
+ * vlc_cancel() is only acted on while blocked in select(), never mid-frame. */
+static void *ReceiveThread(void *data)
 {
-    demux_sys_t *p_sys = p_demux->p_sys;
+    demux_t     *p_demux = data;
+    demux_sys_t *p_sys   = p_demux->p_sys;
     uint8_t pkt[9000];
 
     for (;;)
     {
-        /* select() (and our own recv() below) are not interruption-aware,
-         * so while nothing is arriving we would otherwise never notice a
-         * Stop request; check explicitly each time we come back from a
-         * timeout. */
-        if (vlc_killed())
-            return VLC_DEMUXER_EGENERIC;
-
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(p_sys->fd, &rfds);
         struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
         int r = select(p_sys->fd + 1, &rfds, NULL, NULL, &tv);
+
+        int canc = vlc_savecancel();
 
         if (r == 0)
         {
@@ -689,10 +711,14 @@ static int Demux(demux_t *p_demux)
                           "-- check multicast routing/PIM-SSM reachability from this host",
                           p_sys->i_idle_polls, p_sys->psz_group, p_sys->i_port,
                           (p_sys->psz_source && *p_sys->psz_source) ? p_sys->psz_source : "(none/ASM)");
+            vlc_restorecancel(canc);
             continue;
         }
         if (r < 0)
-            return VLC_DEMUXER_EGENERIC; /* socket error, or object interrupted (e.g. Stop) */
+        {
+            vlc_restorecancel(canc);
+            break; /* socket error */
+        }
 
         p_sys->i_idle_polls = 0;
 
@@ -702,10 +728,14 @@ static int Demux(demux_t *p_demux)
             /* select() said readable but the actual read still failed: a
              * genuine socket error, not a timeout (select() already owns
              * all timeout handling above). */
-            return VLC_DEMUXER_EGENERIC;
+            vlc_restorecancel(canc);
+            break;
         }
         if (n == 0)
+        {
+            vlc_restorecancel(canc);
             continue;
+        }
 
         p_sys->i_pkts_total++;
 
@@ -747,7 +777,10 @@ static int Demux(demux_t *p_demux)
         }
 
         if (!lines_ok)
+        {
+            vlc_restorecancel(canc);
             continue;
+        }
 
         if (p_sys->b_interlace)
         {
@@ -776,11 +809,11 @@ static int Demux(demux_t *p_demux)
                         p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = p_sys->i_pkts_line_fail
                                              = p_sys->i_pkts_no_frame = 0;
                         es_out_Send(p_demux->out, p_sys->es, cur);
-                        return VLC_DEMUXER_SUCCESS;
                     }
-                    /* frame dropped (too few lines received): keep reading */
+                    /* if cur is NULL: frame dropped (too few lines received) */
                 }
             }
+            vlc_restorecancel(canc);
             continue;
         }
 
@@ -806,7 +839,6 @@ static int Demux(demux_t *p_demux)
             p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = p_sys->i_pkts_line_fail
                                  = p_sys->i_pkts_no_frame = 0;
             es_out_Send(p_demux->out, p_sys->es, to_send);
-            return VLC_DEMUXER_SUCCESS;
         }
 
         if (marker)
@@ -819,11 +851,13 @@ static int Demux(demux_t *p_demux)
                 p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = p_sys->i_pkts_line_fail
                                      = p_sys->i_pkts_no_frame = 0;
                 es_out_Send(p_demux->out, p_sys->es, cur);
-                return VLC_DEMUXER_SUCCESS;
             }
-            /* frame dropped (too few lines received): keep reading */
+            /* if cur is NULL: frame dropped (too few lines received) */
         }
+
+        vlc_restorecancel(canc);
     }
+    return NULL;
 }
 
 static int Control(demux_t *p_demux, int i_query, va_list args)

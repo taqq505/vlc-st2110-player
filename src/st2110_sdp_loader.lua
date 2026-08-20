@@ -367,9 +367,15 @@ function play()
   for _, o in ipairs(extra_opts) do table.insert(opts, o) end
   if slave_uri then table.insert(opts, ":input-slave=" .. slave_uri) end
 
+  -- vlc.playlist.add() already starts playback on its own (that's what
+  -- distinguishes it from enqueue()); a real published extension
+  -- (ext_audio_loader) relies on exactly that and never calls .play()
+  -- afterward. Calling .play() here too sends a second, redundant play
+  -- command while the live network item is still mid-open asynchronously,
+  -- which could plausibly interrupt that in-progress open rather than
+  -- being a harmless no-op.
   vlc.playlist.clear()
   vlc.playlist.add({ { path = main_uri, options = opts } })
-  vlc.playlist.play()
   status:set_text("再生開始: " .. table.concat(labels, " + "))
 end
 
