@@ -181,8 +181,14 @@ struct demux_sys_t
     es_out_id_t *p_es;
     date_t       pts;
 
-    /* frame accumulation (tightly packed planar I422_10L: Y, U, V) */
-    uint8_t     *p_buf;
+    /* Frame accumulation: workers write pixels directly into the block_t
+       that will be es_out_Send()'d, instead of a separate scratch buffer
+       that then has to be memcpy'd into one -- on a core-constrained
+       machine an unconditional ~8MB copy every ~30-60 times/sec is real,
+       avoidable cost. Only swapped (by the receive thread, in
+       FinalizeFrame) while no worker is active, i.e. always right after
+       DrainAllWorkers(), so workers reading it concurrently is safe. */
+    block_t     *p_cur_block;
     size_t       i_buf_size;
     size_t       i_y_plane_size;
     size_t       i_uv_plane_size;
@@ -418,17 +424,21 @@ static bool MapLine(const demux_sys_t *p_sys, const rfc4175_line_hdr_t *h,
 }
 
 /* Unpacks RFC4175 YCbCr-4:2:2 10bit GPM pgroups (5 bytes -> Cb,Y0,Cr,Y1)
- * directly into the picture buffer's Y/U/V planes. */
+ * directly into the current output block's Y/U/V planes. */
 static void WriteLines(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
                         unsigned n_hdrs, const uint8_t *data, size_t data_len)
 {
+    if (!p_sys->p_cur_block)
+        return; /* block_Alloc() failed when this cycle started; drop it */
+
     size_t off = 0;
     unsigned half_w = p_sys->i_width / 2;
 
-    uint16_t *y_plane = (uint16_t *)p_sys->p_buf;
-    uint16_t *u_plane = (uint16_t *)(p_sys->p_buf + p_sys->i_y_plane_size);
-    uint16_t *v_plane = (uint16_t *)(p_sys->p_buf + p_sys->i_y_plane_size
-                                                    + p_sys->i_uv_plane_size);
+    uint8_t *buf = p_sys->p_cur_block->p_buffer;
+    uint16_t *y_plane = (uint16_t *)buf;
+    uint16_t *u_plane = (uint16_t *)(buf + p_sys->i_y_plane_size);
+    uint16_t *v_plane = (uint16_t *)(buf + p_sys->i_y_plane_size
+                                          + p_sys->i_uv_plane_size);
 
     for (unsigned i = 0; i < n_hdrs; i++) {
         const rfc4175_line_hdr_t *h = &hdrs[i];
@@ -614,48 +624,56 @@ static void *WorkerThread(void *data)
 static void FinalizeFrame(demux_t *p_demux, demux_sys_t *p_sys)
 {
     unsigned min_lines = p_sys->i_height / 2;
+    bool b_ok = p_sys->i_lines_filled >= min_lines;
 
-    if (p_sys->i_lines_filled < min_lines) {
+    if (!b_ok) {
         p_sys->i_pkts_no_frame++;
-    } else {
-        block_t *p_block = block_Alloc(p_sys->i_buf_size);
-        if (p_block) {
-            memcpy(p_block->p_buffer, p_sys->p_buf, p_sys->i_buf_size);
-            p_block->i_dts = p_block->i_pts = date_Get(&p_sys->pts);
-            es_out_Control(p_demux->out, ES_OUT_SET_PCR, p_block->i_pts);
-            es_out_Send(p_demux->out, p_sys->p_es, p_block);
-        }
+    } else if (p_sys->p_cur_block) {
+        /* Workers already wrote pixels straight into this block (see
+           WriteLines) -- no ~8MB copy needed here, just send it and swap
+           in a fresh one for the next cycle. */
+        p_sys->p_cur_block->i_dts = p_sys->p_cur_block->i_pts = date_Get(&p_sys->pts);
+        es_out_Control(p_demux->out, ES_OUT_SET_PCR, p_sys->p_cur_block->i_pts);
+        es_out_Send(p_demux->out, p_sys->p_es, p_sys->p_cur_block);
         date_Increment(&p_sys->pts, 1);
+
+        p_sys->p_cur_block = block_Alloc(p_sys->i_buf_size);
+        if (p_sys->p_cur_block)
+            memset(p_sys->p_cur_block->p_buffer, 0, p_sys->i_buf_size);
     }
 
     /* Minor per-frame shortfall is normal on a live uncompressed feed; only
        log when it's bad enough to be worth a human's attention, so this
        doesn't itself become a meaningful CPU cost at ~30-60 calls/sec. */
     if (p_sys->i_drop_field2 || p_sys->i_drop_offset || p_sys->i_drop_line_range
-     || p_sys->i_drop_stride || p_sys->i_lines_filled < min_lines) {
+     || p_sys->i_drop_stride || !b_ok) {
         msg_Warn(p_demux, "st2110: frame lines=%u/%u drop(field2=%u offset=%u range=%u stride=%u)",
                  p_sys->i_lines_filled, p_sys->i_height, p_sys->i_drop_field2,
                  p_sys->i_drop_offset, p_sys->i_drop_line_range, p_sys->i_drop_stride);
     }
 
-    /* Clear only the lines that were actually written this cycle, not the
-       whole ~8MB buffer -- lines left untouched are already zero from a
-       previous clear (or from the initial calloc), so re-zeroing them here
-       would be wasted work on every single frame. */
-    unsigned half_w = p_sys->i_width / 2;
-    size_t y_row_bytes = (size_t)p_sys->i_width * 2;
-    size_t uv_row_bytes = (size_t)half_w * 2;
-    uint8_t *y_plane = p_sys->p_buf;
-    uint8_t *u_plane = p_sys->p_buf + p_sys->i_y_plane_size;
-    uint8_t *v_plane = p_sys->p_buf + p_sys->i_y_plane_size + p_sys->i_uv_plane_size;
-    for (unsigned line = 0; line < p_sys->i_height; line++) {
-        if (!p_sys->p_line_filled[line])
-            continue;
-        memset(y_plane + (size_t)line * y_row_bytes, 0, y_row_bytes);
-        memset(u_plane + (size_t)line * uv_row_bytes, 0, uv_row_bytes);
-        memset(v_plane + (size_t)line * uv_row_bytes, 0, uv_row_bytes);
-        p_sys->p_line_filled[line] = false;
+    /* A sent block was already replaced above by a freshly zeroed one. A
+       discarded (malformed) frame reuses the SAME block for the next
+       cycle -- clear only the lines this cycle actually touched, since
+       everything else in it is already zero from before. */
+    if (!b_ok && p_sys->p_cur_block) {
+        unsigned half_w = p_sys->i_width / 2;
+        size_t y_row_bytes = (size_t)p_sys->i_width * 2;
+        size_t uv_row_bytes = (size_t)half_w * 2;
+        uint8_t *y_plane = p_sys->p_cur_block->p_buffer;
+        uint8_t *u_plane = y_plane + p_sys->i_y_plane_size;
+        uint8_t *v_plane = u_plane + p_sys->i_uv_plane_size;
+        for (unsigned line = 0; line < p_sys->i_height; line++) {
+            if (!p_sys->p_line_filled[line])
+                continue;
+            memset(y_plane + (size_t)line * y_row_bytes, 0, y_row_bytes);
+            memset(u_plane + (size_t)line * uv_row_bytes, 0, uv_row_bytes);
+            memset(v_plane + (size_t)line * uv_row_bytes, 0, uv_row_bytes);
+        }
     }
+
+    for (unsigned line = 0; line < p_sys->i_height; line++)
+        p_sys->p_line_filled[line] = false;
     p_sys->i_lines_filled = 0;
     p_sys->i_drop_field2 = p_sys->i_drop_offset = 0;
     p_sys->i_drop_line_range = p_sys->i_drop_stride = 0;
@@ -753,10 +771,12 @@ static void CheckStatsWindow(demux_t *p_demux, demux_sys_t *p_sys)
  * for why). Many overlapped WSARecv()s are kept in flight at once; each
  * wakeup can harvest many finished ones via GetQueuedCompletionStatusEx().
  *
- * The alertable wait (last arg TRUE) lets vlc_cancel()'s APC interrupt a
- * blocked wait if VLC's Windows thread implementation delivers it that
- * way -- but that isn't relied on for correctness: b_stop_requested plus
- * the 1000ms timeout is a bounded-time fallback that guarantees this loop
+ * The wait is non-alertable: shutdown does not rely on vlc_cancel()'s APC
+ * reaching this thread (unverified whether VLC's Windows thread
+ * implementation even delivers it here), and an alertable wait risks
+ * returning early on unrelated APCs at a rate high enough to spin the CPU
+ * for no useful work. Instead, b_stop_requested plus this call's own
+ * 1000ms timeout is a bounded-time fallback that guarantees the loop
  * exits on its own, so Close()'s vlc_join() can never hang the way it did
  * with the old select()-based design. */
 static void *ReceiveThread(void *data)
@@ -773,8 +793,16 @@ static void *ReceiveThread(void *data)
             break;
 
         ULONG n = 0;
+        /* fAlertable=FALSE: b_stop_requested + this call's own 1000ms
+           timeout are the actual shutdown guarantee (see the comment
+           above), so there's no need for an alertable wait here -- and if
+           VLC's Windows thread implementation delivers APCs to this thread
+           for any other reason, an alertable wait would return early on
+           every one of them with nothing to do, which at a high call
+           frequency is a real way to burn a full core doing no useful
+           work at all. */
         BOOL ok = GetQueuedCompletionStatusEx(p_sys->iocp, entries,
-                                               IOCP_MAX_COMPLETIONS, &n, 1000, TRUE);
+                                               IOCP_MAX_COMPLETIONS, &n, 1000, FALSE);
         int canc = vlc_savecancel();
 
         if (!ok) {
@@ -783,7 +811,7 @@ static void *ReceiveThread(void *data)
                 p_sys->i_idle_polls++;
                 if (p_sys->i_idle_polls % 10 == 0)
                     msg_Warn(p_demux, "st2110: no data received for ~%us", p_sys->i_idle_polls);
-            } else if (err != WAIT_IO_COMPLETION) {
+            } else {
                 /* IOCP handle gone or another fatal error */
                 vlc_restorecancel(canc);
                 break;
@@ -1013,10 +1041,11 @@ static int Open(vlc_object_t *obj)
     p_sys->i_y_plane_size  = (size_t)p_sys->i_width * p_sys->i_height * 2;
     p_sys->i_uv_plane_size = (size_t)(p_sys->i_width / 2) * p_sys->i_height * 2;
     p_sys->i_buf_size = p_sys->i_y_plane_size + 2 * p_sys->i_uv_plane_size;
-    p_sys->p_buf = calloc(1, p_sys->i_buf_size);
+    p_sys->p_cur_block = block_Alloc(p_sys->i_buf_size);
     p_sys->p_line_filled = calloc(p_sys->i_height, sizeof(atomic_bool));
-    if (!p_sys->p_buf || !p_sys->p_line_filled)
+    if (!p_sys->p_cur_block || !p_sys->p_line_filled)
         goto error;
+    memset(p_sys->p_cur_block->p_buffer, 0, p_sys->i_buf_size);
 
     es_format_t fmt;
     es_format_Init(&fmt, VIDEO_ES, VLC_CODEC_I422_10L);
@@ -1055,8 +1084,15 @@ static int Open(vlc_object_t *obj)
     for (unsigned i = 0; i < N_WORKERS; i++) {
         p_sys->worker_ctx[i].p_demux = p_demux;
         p_sys->worker_ctx[i].idx = i;
+        /* LOW, not INPUT: these do bulk CPU-bound unpack work with no
+           latency deadline of their own. On a core-constrained machine,
+           giving them the same elevated priority as the time-critical
+           receive thread lets them compete with (and potentially starve)
+           VLC's own decode/convert/render threads for the CPU, which
+           would stall playback even if this module's own pipeline is
+           keeping up fine. */
         if (vlc_clone(&p_sys->worker_threads[i], WorkerThread, &p_sys->worker_ctx[i],
-                      VLC_THREAD_PRIORITY_INPUT)) {
+                      VLC_THREAD_PRIORITY_LOW)) {
             msg_Err(p_demux, "st2110: failed to spawn worker thread %u", i);
             goto error;
         }
@@ -1132,7 +1168,8 @@ static void Close(vlc_object_t *obj)
         net_Close(p_sys->fd);
 
     free(p_sys->psz_source);
-    free(p_sys->p_buf);
+    if (p_sys->p_cur_block)
+        block_Release(p_sys->p_cur_block);
     free(p_sys->p_line_filled);
     free(p_sys);
     p_demux->p_sys = NULL;
