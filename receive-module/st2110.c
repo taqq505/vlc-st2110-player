@@ -25,7 +25,7 @@
 #else
 # include <sys/socket.h>
 # include <netinet/in.h>
-# include <sys/select.h>
+# include <poll.h>
 #endif
 
 #include <vlc_common.h>
@@ -500,7 +500,7 @@ static block_t *FinalizeFrame(demux_t *p_demux)
  * access_demux module st2110" -- this build has repeatedly been debugged
  * against stale .dll copies, so this removes all doubt about which build
  * is actually running. */
-#define ST2110_BUILD_MARKER "st2110 build: recv-thread-arch(no-pf_demux)+auto-detect-lineno"
+#define ST2110_BUILD_MARKER "st2110 build: recv-thread-arch+poll-not-select(stop-fix)"
 
 static int Open(vlc_object_t *p_this)
 {
@@ -692,11 +692,15 @@ static void *ReceiveThread(void *data)
 
     for (;;)
     {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(p_sys->fd, &rfds);
-        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-        int r = select(p_sys->fd + 1, &rfds, NULL, NULL, &tv);
+        /* poll(), not select(): vlc_threads.h #defines poll to its own
+         * vlc_poll(), which is what actually makes this call respond to
+         * vlc_cancel() -- select() has no such substitution anywhere in
+         * VLC, so a thread blocked in raw select() never notices being
+         * cancelled at all, and Close()'s vlc_join() then hangs forever
+         * (Stop stops responding). modules/access/rtp/rtp.c's own
+         * rtp_dgram_thread() uses poll() for exactly this reason. */
+        struct pollfd ufd = { .fd = p_sys->fd, .events = POLLIN };
+        int r = poll(&ufd, 1, 1000 /* ms */);
 
         int canc = vlc_savecancel();
 
