@@ -62,8 +62,9 @@
  * off to these workers so recv()/poll() itself never falls behind and
  * starves the OS socket buffer. 4-core assumption: 1 receive thread + 3
  * workers. */
-#define N_WORKERS    3
-#define QUEUE_SLOTS 32
+#define N_WORKERS     3
+#define QUEUE_SLOTS  32
+#define BATCH_SIZE   16
 
 /*
  * SMPTE ST 2110-20:2017 6.1.5 defines the SRD Line No as zero-based. In
@@ -92,25 +93,38 @@ typedef struct {
     uint16_t offset;      /* raw 15-bit sample offset within the line      */
 } rfc4175_line_hdr_t;
 
-/* One packet's worth of already-parsed headers plus its raw payload bytes,
- * queued from the receive thread to a worker for unpacking. */
+/* One packet's already-parsed headers plus its raw payload bytes. */
 typedef struct {
     rfc4175_line_hdr_t hdrs[MAX_LINE_SEGMENTS];
     unsigned            n_hdrs;
     uint8_t             data[RECV_BUF_LEN];
     size_t              data_len;
+} packet_data_t;
+
+/* A batch of packets handed to one worker in a single dispatch. Batching
+ * matters: at ~80k+ pkts/sec, waking a sleeping worker thread once per
+ * packet costs more in OS wake/context-switch overhead than the few
+ * microseconds of actual unpack work being handed off, so per-packet
+ * dispatch can cost MORE than doing the work inline. Batching amortizes
+ * that wake cost across BATCH_SIZE packets. */
+typedef struct {
+    packet_data_t packets[BATCH_SIZE];
+    unsigned       n_packets;
 } work_item_t;
 
 /* Single-producer (the receive thread) / single-consumer (one worker)
  * bounded queue. SPSC keeps the concurrency reasoning simple: the only
- * two parties touching `head`/`tail` are always the same two threads. */
+ * two parties touching `head`/`tail` are always the same two threads.
+ * A slot is only visible to the worker once `count` covers it (see
+ * StartBatch/PublishBatch), so the receive thread can fill `items[tail]`
+ * without holding the lock. */
 typedef struct {
     vlc_mutex_t lock;
-    vlc_cond_t  cond_work;     /* signaled: an item became available */
-    vlc_cond_t  cond_space;    /* signaled: a slot was freed */
-    vlc_cond_t  cond_drained;  /* signaled: pending reached 0 */
+    vlc_cond_t  cond_work;   /* producer -> worker: a batch was published */
+    vlc_cond_t  cond_avail;  /* worker -> producer: count just decreased
+                                 (frees a slot, and/or satisfies a drain) */
     work_item_t items[QUEUE_SLOTS];
-    unsigned    head, tail, count, pending;
+    unsigned    head, tail, count;
     bool        b_shutdown;
 } worker_queue_t;
 
@@ -443,46 +457,38 @@ static void WriteLines(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
     }
 }
 
-/* Hands one packet's parsed headers + payload to worker `q` for unpacking.
- * Copies into the slot (not just a pointer) so the receive thread's own
- * stack packet buffer can be reused for the next recv() immediately. */
-static void EnqueueWork(worker_queue_t *q, const rfc4175_line_hdr_t *hdrs,
-                         unsigned n_hdrs, const uint8_t *data, size_t data_len)
+/* Reserves the next free slot on `q` for the receive thread to fill
+ * directly (no intermediate copy): the slot is invisible to the worker
+ * until PublishBatch() runs, so filling it needs no lock held. */
+static work_item_t *StartBatch(worker_queue_t *q)
 {
     vlc_mutex_lock(&q->lock);
     while (q->count == QUEUE_SLOTS)
-        vlc_cond_wait(&q->cond_space, &q->lock);
-
+        vlc_cond_wait(&q->cond_avail, &q->lock);
     work_item_t *slot = &q->items[q->tail];
-    memcpy(slot->hdrs, hdrs, n_hdrs * sizeof(*hdrs));
-    slot->n_hdrs = n_hdrs;
-    memcpy(slot->data, data, data_len);
-    slot->data_len = data_len;
+    vlc_mutex_unlock(&q->lock);
+    return slot;
+}
 
+/* Publishes a batch the receive thread just filled via StartBatch(). */
+static void PublishBatch(worker_queue_t *q, work_item_t *slot, unsigned n_packets)
+{
+    slot->n_packets = n_packets;
+    vlc_mutex_lock(&q->lock);
     q->tail = (q->tail + 1) % QUEUE_SLOTS;
     q->count++;
-    q->pending++;
     vlc_cond_signal(&q->cond_work);
     vlc_mutex_unlock(&q->lock);
 }
 
-/* Round-robins packets across the worker pool. */
-static void DispatchWork(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
-                          unsigned n_hdrs, const uint8_t *data, size_t data_len)
-{
-    worker_queue_t *q = &p_sys->queues[p_sys->i_next_worker];
-    p_sys->i_next_worker = (p_sys->i_next_worker + 1) % N_WORKERS;
-    EnqueueWork(q, hdrs, n_hdrs, data, data_len);
-}
-
-/* Blocks until every item already enqueued on `q` has been fully unpacked.
- * Must be called (for every queue) before FinalizeFrame reads the picture
- * buffer, so no worker is still writing into it. */
+/* Blocks until every batch already published on `q` has been fully
+ * unpacked. Must be called (for every queue) before FinalizeFrame reads
+ * the picture buffer, so no worker is still writing into it. */
 static void DrainQueue(worker_queue_t *q)
 {
     vlc_mutex_lock(&q->lock);
-    while (q->pending != 0)
-        vlc_cond_wait(&q->cond_drained, &q->lock);
+    while (q->count != 0)
+        vlc_cond_wait(&q->cond_avail, &q->lock);
     vlc_mutex_unlock(&q->lock);
 }
 
@@ -490,6 +496,45 @@ static void DrainAllWorkers(demux_sys_t *p_sys)
 {
     for (unsigned i = 0; i < N_WORKERS; i++)
         DrainQueue(&p_sys->queues[i]);
+}
+
+/* Receive-thread-local batching state: accumulates parsed packets into the
+ * current worker's reserved slot and publishes it every BATCH_SIZE
+ * packets (or on demand via FlushBatch, e.g. before a frame boundary). */
+typedef struct {
+    worker_queue_t *q;
+    work_item_t    *slot;
+    unsigned         n;
+} batch_state_t;
+
+static void FlushBatch(batch_state_t *b)
+{
+    if (b->q && b->n > 0)
+        PublishBatch(b->q, b->slot, b->n);
+    b->q = NULL;
+    b->slot = NULL;
+    b->n = 0;
+}
+
+static void AddToBatch(demux_sys_t *p_sys, batch_state_t *b,
+                        const rfc4175_line_hdr_t *hdrs, unsigned n_hdrs,
+                        const uint8_t *data, size_t data_len)
+{
+    if (!b->q) {
+        b->q = &p_sys->queues[p_sys->i_next_worker];
+        p_sys->i_next_worker = (p_sys->i_next_worker + 1) % N_WORKERS;
+        b->slot = StartBatch(b->q);
+        b->n = 0;
+    }
+
+    packet_data_t *pd = &b->slot->packets[b->n++];
+    memcpy(pd->hdrs, hdrs, n_hdrs * sizeof(*hdrs));
+    pd->n_hdrs = n_hdrs;
+    memcpy(pd->data, data, data_len);
+    pd->data_len = data_len;
+
+    if (b->n == BATCH_SIZE)
+        FlushBatch(b);
 }
 
 static void *WorkerThread(void *data)
@@ -506,19 +551,22 @@ static void *WorkerThread(void *data)
             vlc_mutex_unlock(&q->lock);
             break;
         }
-
-        work_item_t item = q->items[q->head];
-        q->head = (q->head + 1) % QUEUE_SLOTS;
-        q->count--;
-        vlc_cond_signal(&q->cond_space);
+        unsigned idx = q->head;
         vlc_mutex_unlock(&q->lock);
 
-        WriteLines(p_sys, item.hdrs, item.n_hdrs, item.data, item.data_len);
+        /* Only this worker ever reads `items[idx]` (SPSC), and the
+           producer can't reuse it until `count` drops below QUEUE_SLOTS
+           again below -- safe to process without holding the lock. */
+        work_item_t *item = &q->items[idx];
+        for (unsigned i = 0; i < item->n_packets; i++) {
+            packet_data_t *pd = &item->packets[i];
+            WriteLines(p_sys, pd->hdrs, pd->n_hdrs, pd->data, pd->data_len);
+        }
 
         vlc_mutex_lock(&q->lock);
-        q->pending--;
-        if (q->pending == 0)
-            vlc_cond_signal(&q->cond_drained);
+        q->head = (q->head + 1) % QUEUE_SLOTS;
+        q->count--;
+        vlc_cond_broadcast(&q->cond_avail);
         vlc_mutex_unlock(&q->lock);
     }
 
@@ -587,6 +635,7 @@ static void *ReceiveThread(void *data)
     demux_sys_t *p_sys = p_demux->p_sys;
     uint8_t pkt[RECV_BUF_LEN];
     struct pollfd ufd;
+    batch_state_t batch = { NULL, NULL, 0 };
 
     ufd.fd = p_sys->fd;
     ufd.events = POLLIN;
@@ -675,15 +724,20 @@ static void *ReceiveThread(void *data)
                     p_sys->i_accum_ts = ts;
                     p_sys->i_field_count++;
                     if (p_sys->i_field_count > 2) {
-                        DrainAllWorkers(p_sys);   /* wait out the field just finished */
+                        /* This packet belongs to the new field/frame, so it
+                           must not be in the batch being flushed here. */
+                        FlushBatch(&batch);
+                        DrainAllWorkers(p_sys);
                         FinalizeFrame(p_demux, p_sys);
                         p_sys->i_field_count = 1;
                     }
                 }
-                DispatchWork(p_sys, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
+                AddToBatch(p_sys, &batch, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
             } else {
-                DispatchWork(p_sys, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
+                AddToBatch(p_sys, &batch, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
                 if (marker) {
+                    /* This packet (the frame's last) must be included. */
+                    FlushBatch(&batch);
                     DrainAllWorkers(p_sys);
                     FinalizeFrame(p_demux, p_sys);
                 }
@@ -700,6 +754,11 @@ static void *ReceiveThread(void *data)
                 p_sys->i_stat_window_start = mdate();
             }
         }
+
+        /* Don't let a partial batch sit un-dispatched until the next burst
+           arrives -- flush whatever's accumulated before going back to
+           poll(). */
+        FlushBatch(&batch);
 
         vlc_restorecancel(canc);
     }
@@ -846,8 +905,7 @@ static int Open(vlc_object_t *obj)
         worker_queue_t *q = &p_sys->queues[i];
         vlc_mutex_init(&q->lock);
         vlc_cond_init(&q->cond_work);
-        vlc_cond_init(&q->cond_space);
-        vlc_cond_init(&q->cond_drained);
+        vlc_cond_init(&q->cond_avail);
     }
     p_sys->b_queues_initialized = true;
 
@@ -904,8 +962,7 @@ static void Close(vlc_object_t *obj)
             worker_queue_t *q = &p_sys->queues[i];
             vlc_mutex_destroy(&q->lock);
             vlc_cond_destroy(&q->cond_work);
-            vlc_cond_destroy(&q->cond_space);
-            vlc_cond_destroy(&q->cond_drained);
+            vlc_cond_destroy(&q->cond_avail);
         }
     }
 
