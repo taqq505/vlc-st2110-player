@@ -55,7 +55,7 @@ jobs:
         run: |
           set -e
           VLC_CORE_DLL="/c/Program Files/VideoLAN/VLC/libvlccore.dll"
-          gcc -std=gnu11 -Wall -Wextra -O2 -shared -DPIC -DMODULE_STRING=\"st2110\" \
+          gcc -std=gnu11 -Wall -Wextra -O2 -shared -DPIC -D__PLUGIN__ -DMODULE_STRING=\"st2110\" \
             -I vlc-src/include \
             -o receive-module/libst2110_plugin.dll \
             receive-module/st2110.c \
