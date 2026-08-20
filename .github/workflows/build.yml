@@ -1,5 +1,7 @@
 name: Build
 
+# Manual only: this project is developed on a machine without local build
+# tools, so builds are driven from here on demand rather than on every push.
 on:
   workflow_dispatch:
 
@@ -8,81 +10,65 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Lua
+      - name: Install luac
         run: sudo apt-get update && sudo apt-get install -y lua5.1
-      - name: Syntax-check st2110_sdp_loader.lua
+      - name: Syntax-check the extension
         run: luac5.1 -p src/st2110_sdp_loader.lua
 
   build-receive-module:
-    # st2110.c targets the VLC 3.0.x plugin API (mdate()/mtime_t, see docs
-    # §2/§12-1). Pinned to 22.04 because newer Ubuntu images may ship
-    # libvlccore-dev for VLC 4.x, whose module API has since diverged.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-22.04   # pinned: newer Ubuntu may ship VLC 4.x headers
     steps:
       - uses: actions/checkout@v4
-      - name: Install VLC 3.0.x plugin SDK
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libvlccore-dev
-      - name: Build st2110 access_demux plugin
+      - name: Install VLC plugin SDK
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libvlccore-dev
+      - name: Build
         working-directory: receive-module
         run: make
-      - name: Upload built plugin
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: libst2110_plugin-linux
+          name: vlc-st2110-linux
           path: receive-module/libst2110_plugin.so
 
   build-receive-module-windows:
-    # Produces the .dll actually loadable by the user's local VLC (3.0.16 on
-    # Windows). MinGW-w64 has no VLC dev package to install, so this: (1)
-    # installs VLC 3.0.16 itself via choco purely to get libvlccore.dll to
-    # link against, (2) pulls the matching 3.0.16 plugin headers straight
-    # from the VLC source tree (sparse checkout of include/ only), then
-    # (3) links directly against libvlccore.dll -- MinGW's ld can consume a
-    # DLL's export table directly, no separate import lib (.lib/.a) needed.
-    # UNVERIFIED: this has never actually been run; expect to iterate on the
-    # Actions log if choco's vlc package no longer carries 3.0.16 or a
-    # header/link step needs adjusting.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install VLC 3.0.16 (for libvlccore.dll)
-        run: choco install vlc --version=3.0.16 -y --no-progress
+        run: choco install vlc --version=3.0.16 -y
 
-      - name: Fetch matching VLC 3.0.16 plugin headers
-        shell: bash
+      - name: Fetch matching VLC 3.0.16 headers
         run: |
-          git clone --depth 1 --branch 3.0.16 --filter=blob:none --sparse https://github.com/videolan/vlc.git vlc-src
+          git clone --depth 1 --branch 3.0.16 --filter=blob:none --sparse https://github.com/videolan/vlc vlc-src
           cd vlc-src
           git sparse-checkout set include
+        shell: bash
 
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: true
-          install: mingw-w64-x86_64-toolchain
+          install: mingw-w64-x86_64-gcc
 
-      - name: Build libst2110_plugin.dll
+      - name: Build with MinGW
         shell: msys2 {0}
         run: |
-          cd receive-module
-          gcc -std=gnu99 -Wall -Wextra -shared -fPIC -DPIC -D__PLUGIN__ -DMODULE_STRING='"st2110"' \
-              -I../vlc-src/include \
-              -o libst2110_plugin.dll st2110.c \
-              "/c/Program Files/VideoLAN/VLC/libvlccore.dll" -lws2_32
+          set -e
+          VLC_CORE_DLL="/c/Program Files/VideoLAN/VLC/libvlccore.dll"
+          gcc -std=gnu11 -Wall -Wextra -O2 -DPIC \
+            -I vlc-src/include \
+            -o receive-module/libst2110_plugin.dll \
+            receive-module/st2110.c \
+            "$VLC_CORE_DLL" -lws2_32
 
-      - name: Package plugin + Lua extension together
-        shell: bash
+      - name: Package
         run: |
-          mkdir -p dist
-          cp receive-module/libst2110_plugin.dll dist/
-          cp src/st2110_sdp_loader.lua dist/
-          cp receive-module/WINDOWS_INSTALL.txt dist/
+          mkdir dist
+          copy receive-module\libst2110_plugin.dll dist\
+          copy src\st2110_sdp_loader.lua dist\
+        shell: cmd
 
-      - name: Upload Windows bundle
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: vlc-st2110-windows
-          path: dist/
+          path: dist

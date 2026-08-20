@@ -1,11 +1,13 @@
 /*
- * st2110.c: SMPTE ST 2110-20 (RFC 4175) uncompressed video access_demux for VLC 3.0.x
- * See docs/vlc-st2110_receive-module_仕様書.md for the full specification.
+ * st2110.c - VLC access_demux plugin for SMPTE ST 2110-20 (RFC 4175) reception
+ *
+ * Receives 10bit YCbCr 4:2:2 GPM video carried per RFC 4175 over RTP/UDP and
+ * outputs VLC_CODEC_I422_10L. See docs/vlc-st2110_receive-module_仕様書.md.
+ *
+ * Targets the VLC 3.0.x plugin ABI (mtime_t/date_t, not the VLC4 vlc_tick_t
+ * API).
  */
 
-/* vlc_common.h pulls in vlc_threads.h, which uses poll()/struct pollfd.
- * On MinGW those only come from winsock2.h, and only once _WIN32_WINNT
- * requests Vista+ (WSAPoll). Must be set up before any vlc_*.h include. */
 #ifdef _WIN32
 # ifndef _WIN32_WINNT
 #  define _WIN32_WINNT 0x0601
@@ -15,876 +17,525 @@
 # endif
 # include <winsock2.h>
 # include <ws2tcpip.h>
-/* mingw-w64 provides struct pollfd/WSAPoll() via winsock2.h (given the
- * _WIN32_WINNT bump above) but no plain poll(). VLC's own poll() shim
- * lives in vlc_fixups.h, which is only wired in through VLC's internally
- * generated config.h -- not available to an out-of-tree plugin build.
- * Alias it directly; vlc_threads.h later redefines poll() to its own
- * vlc_poll() wrapper for everything after that point, which is fine. */
-# define poll(fds, nfds, timeout) WSAPoll((void *)(fds), (nfds), (timeout))
-#else
-# include <sys/socket.h>
-# include <netinet/in.h>
-# include <poll.h>
+# define poll(fds, nfds, timeout) WSAPoll((fds), (nfds), (timeout))
+#endif
+
+#ifdef HAVE_CONFIG_H
+# include "config.h"
 #endif
 
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 #include <vlc_demux.h>
 #include <vlc_network.h>
-#include <vlc_block.h>
-#include <vlc_es.h>
-#include <vlc_fourcc.h>
+#include <vlc_threads.h>
 
-#include <stdint.h>
-#include <stdbool.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdbool.h>
 
-static int   Open(vlc_object_t *);
-static void  Close(vlc_object_t *);
-static void *ReceiveThread(void *);
-static int   Control(demux_t *, int, va_list);
+#ifndef _WIN32
+# include <poll.h>
+#endif
 
-vlc_module_begin()
-    set_shortname("ST2110")
-    set_description("SMPTE ST 2110-20 uncompressed video receiver")
-    set_capability("access_demux", 0)
-    set_callbacks(Open, Close)
-    add_shortcut("st2110")
-    set_category(CAT_INPUT)
-    set_subcategory(SUBCAT_INPUT_ACCESS)
+/* ---- RFC 4175 / RTP constants ---- */
+#define RTP_HDR_MIN_LEN        12
+#define RFC4175_EXT_SEQ_LEN     2
+#define RFC4175_LINE_HDR_LEN    6
 
-    add_string ("st2110-source",      "",             "SSM source address", NULL, true)
-    add_integer("st2110-width",       1920,           "Width", NULL, true)
-    add_integer("st2110-height",      1080,           "Height", NULL, true)
-    add_integer("st2110-depth",       10,             "Bit depth", NULL, true)
-    add_string ("st2110-sampling",    "YCbCr-4:2:2",  "Chroma sampling", NULL, true)
-    add_string ("st2110-fps",         "60000/1001",   "Frame rate (num/den)", NULL, true)
-    add_bool   ("st2110-interlace",   false,          "Interlaced", NULL, true)
-    add_string ("st2110-colorimetry", "BT709",        "Colorimetry", NULL, true)
-    add_string ("st2110-tcs",         "SDR",          "Transfer characteristics", NULL, true)
-vlc_module_end()
+#define MAX_LINE_SEGMENTS      64
+#define RECV_BUF_LEN         2048
 
-/* pgroup = 2 pixels of YCbCr 4:2:2 10bit, packed into 5 octets (RFC 4175). */
-#define MAX_LINE_HDRS 180
+#define DEFAULT_WIDTH         1920
+#define DEFAULT_HEIGHT        1080
+#define DEFAULT_FPS_NUM       30000
+#define DEFAULT_FPS_DEN        1001
 
-typedef struct
-{
-    uint16_t len;     /* octets of pixel data carried by this segment */
-    uint16_t line;    /* line number (per-field if interlaced, else per-frame) */
-    uint16_t offset;  /* pixel offset within the line (even) */
-    bool     field2;  /* F bit: false=top/progressive, true=bottom field */
-} line_hdr_t;
+#define SO_RCVBUF_SIZE (32 * 1024 * 1024)
+
+/*
+ * SMPTE ST 2110-20:2017 6.1.5 defines the SRD Line No as zero-based. In
+ * practice, some real SDI-to-IP gateways instead emit the SDI-legacy raw
+ * raster numbering from SMPTE 274M/296M (blanking included). The two
+ * conventions are numerically disjoint for field two of a 1080-line raster
+ * (zero-based: 0-539, SDI-legacy: 584-1123), so we auto-detect per sender
+ * instead of hardcoding either one.
+ */
+#define SMPTE274M_PROGRESSIVE_BASE   42
+#define SMPTE274M_FIELD1_BASE        21
+#define SMPTE274M_FIELD2_BASE       584
+#define LINE_MODE_SDI_LEGACY_MIN    570
+#define LINE_MODE_DETECT_MIN_PKTS     8
+
+typedef enum {
+    LINE_MODE_UNKNOWN = 0,
+    LINE_MODE_ZERO_BASED,
+    LINE_MODE_SDI_LEGACY,
+} line_mode_t;
+
+typedef struct {
+    uint16_t length;      /* segment length in bytes (raw, pgroup-packed)  */
+    bool     field2;      /* RFC4175 F bit                                 */
+    uint16_t line_no;     /* raw 15-bit wire value                         */
+    uint16_t offset;      /* raw 15-bit sample offset within the line      */
+} rfc4175_line_hdr_t;
 
 struct demux_sys_t
 {
-    /* configuration (owned strings) */
-    char     *psz_source;
-    char     *psz_sampling;
-    char     *psz_colorimetry;
-    char     *psz_tcs;
-    unsigned  i_width;
-    unsigned  i_height;
-    unsigned  i_depth;
-    unsigned  i_fps_num;
-    unsigned  i_fps_den;
-    bool      b_interlace;
-    int       line_mode; /* LINE_MODE_*, see WriteLines */
+    /* network */
+    int      fd;
+    char     psz_group[256];
+    int      i_port;
+    char    *psz_source;
 
-    /* socket */
-    int       fd;
-    char      psz_group[256];
-    int       i_port;
-    unsigned  i_idle_polls; /* consecutive receive timeouts with zero data */
+    /* format */
+    unsigned i_width;
+    unsigned i_height;
+    unsigned i_depth;
+    bool     b_interlace;
+    unsigned i_fps_num;
+    unsigned i_fps_den;
 
-    /* receive thread: modules/access/rtp/rtp.c (VLC's own RTP access_demux)
-     * runs its own vlc_clone()'d thread that reads the socket and calls
-     * es_out_Send() directly, rather than implementing pf_demux -- pf_demux
-     * is left NULL there, exactly like here. Live network sources don't fit
-     * the "core pulls one demux worth of data at a time" model pf_demux
-     * implies; a self-driven thread matches how VLC's own such module
-     * actually does it. */
+    /* line-number convention, detected from the first few packets */
+    line_mode_t line_mode;
+
+    /* elementary stream */
+    es_out_id_t *p_es;
+    date_t       pts;
+
+    /* frame accumulation (tightly packed planar I422_10L: Y, U, V) */
+    uint8_t *p_buf;
+    size_t   i_buf_size;
+    size_t   i_y_plane_size;
+    size_t   i_uv_plane_size;
+    bool    *p_line_filled;
+    unsigned i_lines_filled;
+    bool     b_seen_field2_pkt;
+
+    /* per-frame drop counters, reset after each finalized/dropped frame */
+    unsigned i_drop_field2;
+    unsigned i_drop_offset;
+    unsigned i_drop_line_range;
+    unsigned i_drop_stride;
+
+    /* receive thread */
     vlc_thread_t thread;
-    bool         thread_ready;
+    bool         b_thread_started;
 
-    /* packets ARE arriving but no frame has completed yet -- e.g. the
-     * marker bit is never set by this sender, or (interlace) the two
-     * fields never both get marker-terminated. Distinct from i_idle_polls
-     * (zero packets); logged on its own timer, see ReceiveThread(). Broken down by
-     * pipeline stage so a systematic parse failure (which would silently
-     * `continue` before ever reaching the old single counter) is visible
-     * too -- every received packet is accounted for somewhere. */
+    /* rolling diagnostics, reset every ~5s */
+    mtime_t  i_stat_window_start;
     unsigned i_pkts_total;
     unsigned i_pkts_rtp_fail;
     unsigned i_pkts_line_fail;
     unsigned i_pkts_no_frame;
-    mtime_t  i_last_no_frame_log;
-
-    /* elementary stream */
-    es_out_id_t *es;
-    mtime_t      i_pts_delay;
-
-    /* packed-frame accumulation buffer: height * stride_packed bytes */
-    uint8_t  *p_buf;
-    size_t    i_stride_packed;
-    size_t    i_buf_size;
-    bool     *p_line_filled;
-    unsigned  i_lines_filled;
-
-    /* line-segment drop counters for the frame currently being assembled.
-     * Logged as one summary per frame in FinalizeFrame rather than per
-     * packet: on a real high-bitrate stream a systematic mismatch (e.g.
-     * wrong line-numbering assumption) can drop the large majority of
-     * packets, and logging each one can emit tens of thousands of lines
-     * per second -- enough to flood VLC's message console and hang the
-     * whole UI, especially with the Messages window open. */
-    unsigned  i_drop_field2;
-    unsigned  i_drop_offset;
-    unsigned  i_drop_line_range;
-    unsigned  i_drop_stride;
-
-    /* current in-progress frame (progressive) */
-    bool      b_frame_open;
-    uint32_t  i_frame_ts;
-
-    /* current in-progress field pair (interlace only): whether a
-     * marker-terminated top (F=0) / bottom (F=1) field has been woven
-     * into the shared frame buffer since the last flush. */
-    bool      b_field_seen[2];
+    unsigned i_idle_polls;
 };
 
-/* ------------------------------------------------------------------------ */
+static int  Open(vlc_object_t *);
+static void Close(vlc_object_t *);
+static int  Control(demux_t *, int, va_list);
+static void *ReceiveThread(void *);
+
+vlc_module_begin()
+    set_shortname("ST2110")
+    set_description(N_("SMPTE ST 2110-20 receiver (RFC 4175, 10bit GPM)"))
+    set_capability("access_demux", 0)
+    set_category(CAT_INPUT)
+    set_subcategory(SUBCAT_INPUT_ACCESS)
+    add_shortcut("st2110")
+    set_callbacks(Open, Close)
+
+    add_string("st2110-source", NULL, N_("Source filter address (SSM)"), NULL, true)
+    add_integer("st2110-width", DEFAULT_WIDTH, N_("Width"), NULL, true)
+    add_integer("st2110-height", DEFAULT_HEIGHT, N_("Height"), NULL, true)
+    add_integer("st2110-depth", 10, N_("Sample depth (bits)"), NULL, true)
+    add_string("st2110-sampling", "YCbCr-4:2:2", N_("Chroma sampling"), NULL, true)
+    add_string("st2110-fps", "30000/1001", N_("Frame rate (num/den)"), NULL, true)
+    add_string("st2110-colorimetry", "BT709", N_("Colorimetry (BT709/BT2020/ST2084/HLG)"), NULL, true)
+    add_bool("st2110-interlace", false, N_("Interlaced"), NULL, true)
+vlc_module_end()
+
+/* ---- helpers ---- */
 
 static void ParseFraction(const char *s, unsigned *num, unsigned *den)
 {
-    unsigned n = 60000, d = 1001;
-    unsigned a, b;
+    *num = DEFAULT_FPS_NUM;
+    *den = DEFAULT_FPS_DEN;
+    if (!s || !*s)
+        return;
 
-    if (s && *s)
-    {
-        if (sscanf(s, "%u/%u", &a, &b) == 2 && b > 0)
-        {
-            n = a;
-            d = b;
-        }
-        else if (sscanf(s, "%u", &a) == 1 && a > 0)
-        {
-            n = a;
-            d = 1;
-        }
+    const char *slash = strchr(s, '/');
+    unsigned n = (unsigned)atoi(s);
+    unsigned d = slash ? (unsigned)atoi(slash + 1) : 1;
+    if (n > 0 && d > 0) {
+        *num = n;
+        *den = d;
     }
-    *num = n;
-    *den = d;
 }
 
-static void SetColorimetry(video_format_t *v, const char *colorimetry, const char *tcs)
+static void SetColorimetry(video_format_t *v, const char *psz_colorimetry)
 {
-    if (colorimetry && !strcmp(colorimetry, "BT2020"))
-    {
+    v->b_color_range_full = false;
+
+    if (psz_colorimetry && strcmp(psz_colorimetry, "BT2020") == 0) {
         v->primaries = COLOR_PRIMARIES_BT2020;
         v->space     = COLOR_SPACE_BT2020;
-        if (tcs && !strcmp(tcs, "PQ"))
-            v->transfer = TRANSFER_FUNC_SMPTE_ST2084;
-        else if (tcs && !strcmp(tcs, "HLG"))
-            v->transfer = TRANSFER_FUNC_HLG;
-        else
-            /* video_transfer_func_t has no dedicated BT2020 value in this
-             * VLC version; BT.2020 SDR's OETF is numerically the same as
-             * BT.709's, so that's the correct fallback, not a placeholder. */
-            v->transfer = TRANSFER_FUNC_BT709;
-    }
-    else
-    {
+        /* No dedicated BT.2020 SDR OETF value in this VLC version; BT.2020's
+           SDR OETF is numerically identical to BT.709's, so this fallback
+           is exact, not approximate. */
+        v->transfer  = TRANSFER_FUNC_BT709;
+    } else if (psz_colorimetry && strcmp(psz_colorimetry, "ST2084") == 0) {
+        v->primaries = COLOR_PRIMARIES_BT2020;
+        v->space     = COLOR_SPACE_BT2020;
+        v->transfer  = TRANSFER_FUNC_SMPTE_ST2084;
+    } else if (psz_colorimetry && strcmp(psz_colorimetry, "HLG") == 0) {
+        v->primaries = COLOR_PRIMARIES_BT2020;
+        v->space     = COLOR_SPACE_BT2020;
+        v->transfer  = TRANSFER_FUNC_HLG;
+    } else {
         v->primaries = COLOR_PRIMARIES_BT709;
         v->space     = COLOR_SPACE_BT709;
         v->transfer  = TRANSFER_FUNC_BT709;
     }
-    v->b_color_range_full = false; /* narrow/video range, per spec §5.8 */
 }
 
-/* RTP header (RFC 3550). Validates all offsets against the received length
- * before touching them -- this parses attacker-reachable network input. */
-static bool ParseRTP(const uint8_t *p, size_t len, uint32_t *pts_ts, bool *marker,
-                      const uint8_t **out_payload, size_t *out_len)
+/* Parses the fixed 12-byte RTP header (plus CSRC list / extension header if
+ * present) and returns the byte offset where the RTP payload begins. */
+static int ParseRTP(const uint8_t *p, size_t len, unsigned *hdr_len,
+                     uint32_t *timestamp, bool *marker)
 {
-    if (len < 12 || (p[0] >> 6) != 2)
-        return false;
+    if (len < RTP_HDR_MIN_LEN)
+        return -1;
+    if ((p[0] >> 6) != 2)          /* RTP version must be 2 */
+        return -1;
 
-    bool     pad = (p[0] & 0x20) != 0;
-    bool     ext = (p[0] & 0x10) != 0;
-    unsigned cc  = p[0] & 0x0f;
-
+    unsigned cc = p[0] & 0x0f;
+    bool ext = (p[0] & 0x10) != 0;
     *marker = (p[1] & 0x80) != 0;
+    *timestamp = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16)
+               | ((uint32_t)p[6] << 8)  |  (uint32_t)p[7];
 
-    size_t hdr = 12 + (size_t)cc * 4;
-    if (hdr > len)
-        return false;
-
-    if (ext)
-    {
-        if (hdr + 4 > len)
-            return false;
-        unsigned ext_words = ((unsigned)p[hdr + 2] << 8) | p[hdr + 3];
-        hdr += 4 + (size_t)ext_words * 4;
-        if (hdr > len)
-            return false;
+    size_t off = RTP_HDR_MIN_LEN + (size_t)cc * 4;
+    if (off + (ext ? 4 : 0) > len)
+        return -1;
+    if (ext) {
+        uint16_t ext_words = ((uint16_t)p[off + 2] << 8) | p[off + 3];
+        off += 4 + (size_t)ext_words * 4;
     }
+    if (off > len)
+        return -1;
 
-    size_t plen = len - hdr;
-    if (pad)
-    {
-        if (plen == 0)
-            return false;
-        uint8_t pad_len = p[len - 1];
-        if (pad_len == 0 || pad_len > plen)
-            return false;
-        plen -= pad_len;
-    }
-
-    *pts_ts     = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16)
-                | ((uint32_t)p[6] << 8)  |  (uint32_t)p[7];
-    *out_payload = p + hdr;
-    *out_len     = plen;
-    return true;
+    *hdr_len = (unsigned)off;
+    return 0;
 }
 
-/* ST 2110-20 payload header: 2-octet ESN, then a chain of 6-octet line
- * headers (continuation bit C==1 while more follow), then the pixel data
- * for each declared segment concatenated in the same order. */
-static bool ParseLineHeaders(const uint8_t *p, size_t len,
-                              line_hdr_t *lines, unsigned *n_lines,
-                              const uint8_t **out_pixels, size_t *out_pixels_len)
+/* Parses the chained RFC4175 Sample Row Data headers that follow the
+ * Extended Sequence Number. Returns the number of headers and the total
+ * byte length of the header chain (payload data follows immediately). */
+static int ParseLineHeaders(const uint8_t *p, size_t len,
+                             rfc4175_line_hdr_t *hdrs, unsigned max_hdrs,
+                             unsigned *out_n, size_t *out_hdr_bytes)
 {
-    if (len < 2)
-        return false;
+    unsigned n = 0;
+    size_t off = 0;
 
-    size_t   pos = 2; /* skip Extended Sequence Number */
-    unsigned k = 0;
+    for (;;) {
+        if (off + RFC4175_LINE_HDR_LEN > len || n >= max_hdrs)
+            return -1;
 
-    for (;;)
-    {
-        if (pos + 6 > len || k >= MAX_LINE_HDRS)
-            return false;
+        uint16_t length = ((uint16_t)p[off] << 8) | p[off + 1];
+        uint16_t f_line  = ((uint16_t)p[off + 2] << 8) | p[off + 3];
+        uint16_t c_off   = ((uint16_t)p[off + 4] << 8) | p[off + 5];
 
-        uint16_t seg_len = ((uint16_t)p[pos]     << 8) | p[pos + 1];
-        uint16_t fl       = ((uint16_t)p[pos + 2] << 8) | p[pos + 3];
-        uint16_t co       = ((uint16_t)p[pos + 4] << 8) | p[pos + 5];
-        pos += 6;
+        hdrs[n].length  = length;
+        hdrs[n].field2  = (f_line & 0x8000) != 0;
+        hdrs[n].line_no = f_line & 0x7fff;
+        hdrs[n].offset  = c_off & 0x7fff;
+        bool cont       = (c_off & 0x8000) != 0;
 
-        lines[k].len    = seg_len;
-        lines[k].field2 = (fl >> 15) != 0;
-        lines[k].line   = fl & 0x7fff;
-        lines[k].offset = co & 0x7fff;
-        bool cont        = (co >> 15) != 0;
-        k++;
-
+        off += RFC4175_LINE_HDR_LEN;
+        n++;
         if (!cont)
             break;
     }
 
-    size_t total = 0;
-    for (unsigned i = 0; i < k; i++)
-        total += lines[i].len;
-    if (pos + total > len)
-        return false; /* declared segment lengths exceed what was received */
-
-    *n_lines         = k;
-    *out_pixels      = p + pos;
-    *out_pixels_len  = total;
-    return true;
+    *out_n = n;
+    *out_hdr_bytes = off;
+    return 0;
 }
 
-static void ResetFrameBuffer(demux_sys_t *p_sys)
+static void DetectLineMode(demux_t *p_demux, demux_sys_t *p_sys,
+                            const rfc4175_line_hdr_t *hdrs, unsigned n)
 {
-    memset(p_sys->p_buf, 0, p_sys->i_buf_size);
-    memset(p_sys->p_line_filled, 0, p_sys->i_height * sizeof(bool));
-    p_sys->i_lines_filled = 0;
-    p_sys->i_drop_field2 = p_sys->i_drop_offset = p_sys->i_drop_line_range = p_sys->i_drop_stride = 0;
-}
-
-/* SMPTE ST 2110-20:2017 §6.1.5 Note 1 mandates the SRD Row Number ("Line
- * No") be a ZERO-BASED sample row number, distinct from RFC 4175's own
- * SMPTE-274M/296M raw-raster numbering (SDI-legacy, includes blanking).
- * In practice, though, many real senders -- especially SDI-to-IP gateways
- * carrying a camera's native SDI line numbers straight through -- emit the
- * SDI-legacy numbers instead of renumbering to zero-based. A receiver that
- * hardcodes either convention silently drops most of a real stream sent
- * with the other one. So: detect which convention this sender is actually
- * using from the observed values, rather than assume.
- *
- * For SMPTE 274M (1920x1080, the only raster this module supports) the two
- * conventions are numerically disjoint for field two: zero-based field two
- * is 0-539, SDI-legacy field two is 584-1123. LINE_MODE_SDI_LEGACY_MIN
- * sits in the gap between them, so a single field-two packet settles it.
- * Field one / progressive lines overlap between the conventions (21-539),
- * but zero-based-only line 0-20 still disambiguates unassisted. */
-typedef enum { LINE_MODE_UNKNOWN = 0, LINE_MODE_ZERO_BASED, LINE_MODE_SDI_LEGACY } line_mode_t;
-
-#define SMPTE274M_PROGRESSIVE_BASE 42
-#define SMPTE274M_FIELD1_BASE      21
-#define SMPTE274M_FIELD2_BASE      584
-#define LINE_MODE_SDI_LEGACY_MIN   570  /* below SMPTE274M_FIELD2_BASE, above any zero-based field line */
-
-static void DetectLineMode(demux_t *p_demux, uint16_t raw_line)
-{
-    demux_sys_t *p_sys = p_demux->p_sys;
     if (p_sys->line_mode != LINE_MODE_UNKNOWN)
         return;
 
-    if (raw_line < SMPTE274M_FIELD1_BASE)
-    {
+    for (unsigned i = 0; i < n; i++) {
+        if (hdrs[i].line_no >= LINE_MODE_SDI_LEGACY_MIN) {
+            p_sys->line_mode = LINE_MODE_SDI_LEGACY;
+            msg_Info(p_demux, "st2110: detected SDI-legacy (SMPTE274M raw raster) line numbering");
+            return;
+        }
+    }
+
+    /* Only commit to zero-based after enough packets that an unlucky first
+       packet (e.g. only low field-one lines) can't cause a misdetection. */
+    if (p_sys->i_pkts_total >= LINE_MODE_DETECT_MIN_PKTS) {
         p_sys->line_mode = LINE_MODE_ZERO_BASED;
-        msg_Info(p_demux, "detected zero-based line numbering (ST 2110-20 spec convention; saw line %u)", raw_line);
+        msg_Info(p_demux, "st2110: detected zero-based (ST2110-20 spec) line numbering");
     }
-    else if (raw_line >= LINE_MODE_SDI_LEGACY_MIN)
-    {
-        p_sys->line_mode = LINE_MODE_SDI_LEGACY;
-        msg_Info(p_demux, "detected SDI-legacy (SMPTE 274M raw raster) line numbering "
-                  "(common on SDI-to-IP gateways; saw line %u)", raw_line);
-    }
-    /* else: still in the 21-569 overlap zone, keep waiting */
 }
 
-/* Writes each declared line segment into the packed frame buffer. Every
- * segment is bounds-checked against height/stride before the memcpy: this
- * data comes straight off the wire and must never drive an out-of-bounds
- * write. Segments that fail validation are dropped and counted (not logged
- * per-segment -- see the i_drop_* counters and their summary log in
- * FinalizeFrame); the rest of the frame is still assembled best-effort.
- * Segments seen before the line-numbering convention is determined (see
- * DetectLineMode) are also dropped as i_drop_line_range, since they can't
- * be placed correctly yet -- this only costs the first field or so.
- *
- * In interlace mode the two fields are woven into one full-height buffer
- * as actual_line = field_relative_line*2+F, matching how VLC expects a
- * full picture. */
-static void WriteLines(demux_t *p_demux, const line_hdr_t *lines, unsigned n_lines,
-                        const uint8_t *pixels, size_t pixels_len)
+/* Maps a wire line header to the output picture's row index, normalizing
+ * away the SDI-legacy base offset when detected, then weaving fields for
+ * interlace (ST2110-20 6.1.5 Note 2: field two's rows are interleaved
+ * "below" the like-numbered rows of field one). */
+static bool MapLine(const demux_sys_t *p_sys, const rfc4175_line_hdr_t *h,
+                     unsigned *out_line)
 {
-    demux_sys_t *p_sys = p_demux->p_sys;
-    size_t pos = 0;
+    unsigned line = h->line_no;
 
-    for (unsigned i = 0; i < n_lines; i++)
-    {
-        uint16_t seg_len = lines[i].len;
-        if (pos + seg_len > pixels_len)
-            break;
+    if (p_sys->line_mode == LINE_MODE_SDI_LEGACY) {
+        unsigned base = p_sys->b_interlace
+                       ? (h->field2 ? SMPTE274M_FIELD2_BASE : SMPTE274M_FIELD1_BASE)
+                       : SMPTE274M_PROGRESSIVE_BASE;
+        if (line < base)
+            return false;
+        line -= base;
+    }
 
-        if (!p_sys->b_interlace && lines[i].field2)
-        {
+    *out_line = p_sys->b_interlace ? (line * 2 + (h->field2 ? 1 : 0)) : line;
+    return true;
+}
+
+/* Unpacks RFC4175 YCbCr-4:2:2 10bit GPM pgroups (5 bytes -> Cb,Y0,Cr,Y1)
+ * directly into the picture buffer's Y/U/V planes. Returns true if any
+ * header in this packet belonged to field two. */
+static bool WriteLines(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
+                        unsigned n_hdrs, const uint8_t *data, size_t data_len)
+{
+    bool b_saw_field2 = false;
+    size_t off = 0;
+    unsigned half_w = p_sys->i_width / 2;
+
+    uint16_t *y_plane = (uint16_t *)p_sys->p_buf;
+    uint16_t *u_plane = (uint16_t *)(p_sys->p_buf + p_sys->i_y_plane_size);
+    uint16_t *v_plane = (uint16_t *)(p_sys->p_buf + p_sys->i_y_plane_size
+                                                    + p_sys->i_uv_plane_size);
+
+    for (unsigned i = 0; i < n_hdrs; i++) {
+        const rfc4175_line_hdr_t *h = &hdrs[i];
+        if (h->field2)
+            b_saw_field2 = true;
+
+        if (off + h->length > data_len) {
+            p_sys->i_drop_stride++;
+            break; /* the rest of the chain can't be trusted either */
+        }
+
+        if (h->field2 && !p_sys->b_interlace) {
             p_sys->i_drop_field2++;
+            off += h->length;
+            continue;
         }
-        else if (lines[i].offset % 2 != 0)
-        {
-            p_sys->i_drop_offset++;
+        if (h->length % 5 != 0 || h->offset % 2 != 0) {
+            p_sys->i_drop_stride++;
+            off += h->length;
+            continue;
         }
-        else
-        {
-            DetectLineMode(p_demux, lines[i].line);
 
-            unsigned field_lines = p_sys->b_interlace ? p_sys->i_height / 2 : p_sys->i_height;
-            unsigned base = 0;
-            if (p_sys->line_mode == LINE_MODE_SDI_LEGACY)
-                base = p_sys->b_interlace
-                     ? (lines[i].field2 ? SMPTE274M_FIELD2_BASE : SMPTE274M_FIELD1_BASE)
-                     : SMPTE274M_PROGRESSIVE_BASE;
+        unsigned out_line;
+        if (!MapLine(p_sys, h, &out_line) || out_line >= p_sys->i_height) {
+            p_sys->i_drop_line_range++;
+            off += h->length;
+            continue;
+        }
 
-            if (p_sys->line_mode == LINE_MODE_UNKNOWN
-             || lines[i].line < base || (unsigned)lines[i].line - base >= field_lines)
-            {
-                p_sys->i_drop_line_range++;
-                pos += seg_len;
-                continue;
+        unsigned n_pgroups = h->length / 5;
+        const uint8_t *seg = data + off;
+        bool line_ok = true;
+
+        for (unsigned j = 0; j < n_pgroups; j++) {
+            unsigned x = h->offset + j * 2;
+            if (x + 1 >= p_sys->i_width) {
+                line_ok = false;
+                break;
             }
-            unsigned field_relative_line = (unsigned)lines[i].line - base;
 
-            unsigned actual_line = p_sys->b_interlace
-                                  ? field_relative_line * 2 + (lines[i].field2 ? 1 : 0)
-                                  : field_relative_line;
-            size_t byte_off = ((size_t)lines[i].offset / 2) * 5;
-            if (byte_off + seg_len > p_sys->i_stride_packed)
-            {
-                p_sys->i_drop_stride++;
-            }
-            else
-            {
-                memcpy(p_sys->p_buf + (size_t)actual_line * p_sys->i_stride_packed + byte_off,
-                       pixels + pos, seg_len);
-                if (!p_sys->p_line_filled[actual_line])
-                {
-                    p_sys->p_line_filled[actual_line] = true;
-                    p_sys->i_lines_filled++;
-                }
-            }
+            const uint8_t *b = seg + j * 5;
+            uint16_t cb = (uint16_t)((b[0] << 2) | (b[1] >> 6));
+            uint16_t y0 = (uint16_t)(((b[1] & 0x3f) << 4) | (b[2] >> 4));
+            uint16_t cr = (uint16_t)(((b[2] & 0x0f) << 6) | (b[3] >> 2));
+            uint16_t y1 = (uint16_t)(((b[3] & 0x03) << 8) | b[4]);
+
+            y_plane[out_line * p_sys->i_width + x]     = y0;
+            y_plane[out_line * p_sys->i_width + x + 1] = y1;
+            u_plane[out_line * half_w + x / 2]          = cb;
+            v_plane[out_line * half_w + x / 2]          = cr;
+        }
+        if (!line_ok)
+            p_sys->i_drop_stride++;
+
+        if (!p_sys->p_line_filled[out_line]) {
+            p_sys->p_line_filled[out_line] = true;
+            p_sys->i_lines_filled++;
         }
 
-        pos += seg_len;
+        off += h->length;
     }
+
+    return b_saw_field2;
 }
 
-/* Unpacks the accumulated 10bit 4:2:2 GPM buffer into a planar
- * VLC_CODEC_I422_10L block (10bit samples in the low bits of 16bit LE
- * words). Frames with too few received lines are dropped rather than
- * shown as mostly-black/garbage (threshold left to implementer discretion
- * per the spec's open question). */
-static block_t *FinalizeFrame(demux_t *p_demux)
+static void FinalizeFrame(demux_t *p_demux, demux_sys_t *p_sys)
 {
-    demux_sys_t *p_sys = p_demux->p_sys;
+    unsigned min_lines = p_sys->i_height / 2;
 
-    if (p_sys->i_drop_field2 || p_sys->i_drop_offset || p_sys->i_drop_line_range || p_sys->i_drop_stride)
-    {
-        msg_Warn(p_demux, "dropped segments this frame: field2=%u odd-offset=%u "
-                  "line-range=%u stride=%u",
-                  p_sys->i_drop_field2, p_sys->i_drop_offset,
-                  p_sys->i_drop_line_range, p_sys->i_drop_stride);
-    }
-
-    if (p_sys->i_lines_filled < p_sys->i_height / 2)
-    {
-        msg_Warn(p_demux, "dropping frame: only %u/%u lines received",
-                  p_sys->i_lines_filled, p_sys->i_height);
-        return NULL;
-    }
-
-    unsigned w = p_sys->i_width, h = p_sys->i_height;
-    size_t y_plane = (size_t)w * h * 2;
-    size_t c_plane = (size_t)(w / 2) * h * 2;
-
-    block_t *block = block_Alloc(y_plane + 2 * c_plane);
-    if (!block)
-        return NULL;
-
-    uint8_t *py = block->p_buffer;
-    uint8_t *pu = py + y_plane;
-    uint8_t *pv = pu + c_plane;
-    size_t y_stride = (size_t)w * 2;
-    size_t c_stride = (size_t)(w / 2) * 2;
-
-    for (unsigned y = 0; y < h; y++)
-    {
-        const uint8_t *row  = p_sys->p_buf + (size_t)y * p_sys->i_stride_packed;
-        uint8_t       *yrow = py + (size_t)y * y_stride;
-        uint8_t       *urow = pu + (size_t)y * c_stride;
-        uint8_t       *vrow = pv + (size_t)y * c_stride;
-
-        for (unsigned x2 = 0; x2 < w / 2; x2++)
-        {
-            const uint8_t *pg = row + (size_t)x2 * 5;
-            uint16_t cb = ((uint16_t)pg[0] << 2) | (pg[1] >> 6);
-            uint16_t y0 = (((uint16_t)pg[1] & 0x3f) << 4) | (pg[2] >> 4);
-            uint16_t cr = (((uint16_t)pg[2] & 0x0f) << 6) | (pg[3] >> 2);
-            uint16_t y1 = (((uint16_t)pg[3] & 0x03) << 8) |  pg[4];
-
-            uint8_t *yy = yrow + (size_t)x2 * 4;
-            yy[0] = (uint8_t)y0;       yy[1] = (uint8_t)(y0 >> 8);
-            yy[2] = (uint8_t)y1;       yy[3] = (uint8_t)(y1 >> 8);
-
-            uint8_t *uu = urow + (size_t)x2 * 2;
-            uu[0] = (uint8_t)cb;       uu[1] = (uint8_t)(cb >> 8);
-
-            uint8_t *vv = vrow + (size_t)x2 * 2;
-            vv[0] = (uint8_t)cr;       vv[1] = (uint8_t)(cr >> 8);
+    if (p_sys->i_lines_filled < min_lines) {
+        p_sys->i_pkts_no_frame++;
+    } else {
+        block_t *p_block = block_Alloc(p_sys->i_buf_size);
+        if (p_block) {
+            memcpy(p_block->p_buffer, p_sys->p_buf, p_sys->i_buf_size);
+            p_block->i_dts = p_block->i_pts = date_Get(&p_sys->pts);
+            es_out_Control(p_demux->out, ES_OUT_SET_PCR, p_block->i_pts);
+            es_out_Send(p_demux->out, p_sys->p_es, p_block);
         }
+        date_Increment(&p_sys->pts, 1);
     }
 
-    block->i_dts = block->i_pts = mdate() + p_sys->i_pts_delay;
-    return block;
+    if (p_sys->i_drop_field2 || p_sys->i_drop_offset || p_sys->i_drop_line_range
+     || p_sys->i_drop_stride || p_sys->i_lines_filled < p_sys->i_height) {
+        msg_Warn(p_demux, "st2110: frame lines=%u/%u drop(field2=%u offset=%u range=%u stride=%u)",
+                 p_sys->i_lines_filled, p_sys->i_height, p_sys->i_drop_field2,
+                 p_sys->i_drop_offset, p_sys->i_drop_line_range, p_sys->i_drop_stride);
+    }
+
+    memset(p_sys->p_buf, 0, p_sys->i_buf_size);
+    memset(p_sys->p_line_filled, 0, p_sys->i_height * sizeof(bool));
+    p_sys->i_lines_filled = 0;
+    p_sys->i_drop_field2 = p_sys->i_drop_offset = 0;
+    p_sys->i_drop_line_range = p_sys->i_drop_stride = 0;
 }
 
-/* ------------------------------------------------------------------------ */
-
-/* Bump this string whenever st2110.c changes, and check for it in the VLC
- * log (Tools/View > Messages) as the very first thing after "using
- * access_demux module st2110" -- this build has repeatedly been debugged
- * against stale .dll copies, so this removes all doubt about which build
- * is actually running. */
-#define ST2110_BUILD_MARKER "st2110 build: recv-thread-arch+poll-not-select(stop-fix)"
-
-static int Open(vlc_object_t *p_this)
-{
-    demux_t *p_demux = (demux_t *)p_this;
-
-    msg_Info(p_demux, ST2110_BUILD_MARKER);
-
-    if (!p_demux->psz_location || !*p_demux->psz_location)
-    {
-        msg_Err(p_demux, "missing MRL, expected st2110://<group>:<port>");
-        return VLC_EGENERIC;
-    }
-
-    char     psz_group[256];
-    int      i_port;
-    {
-        const char *psz_loc   = p_demux->psz_location;
-        const char *psz_colon = strrchr(psz_loc, ':');
-        if (!psz_colon || psz_colon == psz_loc)
-        {
-            msg_Err(p_demux, "invalid MRL, expected st2110://<group>:<port>");
-            return VLC_EGENERIC;
-        }
-        size_t len = (size_t)(psz_colon - psz_loc);
-        if (len == 0 || len >= sizeof(psz_group))
-        {
-            msg_Err(p_demux, "invalid MRL: group address too long");
-            return VLC_EGENERIC;
-        }
-        memcpy(psz_group, psz_loc, len);
-        psz_group[len] = '\0';
-
-        i_port = atoi(psz_colon + 1);
-        if (i_port <= 0 || i_port > 65535)
-        {
-            msg_Err(p_demux, "invalid MRL: bad port");
-            return VLC_EGENERIC;
-        }
-    }
-
-    demux_sys_t *p_sys = calloc(1, sizeof(*p_sys));
-    if (!p_sys)
-        return VLC_ENOMEM;
-    p_demux->p_sys = p_sys;
-    p_sys->fd = -1;
-    memcpy(p_sys->psz_group, psz_group, sizeof(psz_group));
-    p_sys->i_port = i_port;
-
-    p_sys->psz_source      = var_InheritString(p_demux, "st2110-source");
-    p_sys->i_width          = var_InheritInteger(p_demux, "st2110-width");
-    p_sys->i_height         = var_InheritInteger(p_demux, "st2110-height");
-    p_sys->i_depth          = var_InheritInteger(p_demux, "st2110-depth");
-    p_sys->psz_sampling    = var_InheritString(p_demux, "st2110-sampling");
-    p_sys->b_interlace      = var_InheritBool(p_demux, "st2110-interlace");
-    p_sys->psz_colorimetry = var_InheritString(p_demux, "st2110-colorimetry");
-    p_sys->psz_tcs         = var_InheritString(p_demux, "st2110-tcs");
-    {
-        char *psz_fps = var_InheritString(p_demux, "st2110-fps");
-        ParseFraction(psz_fps, &p_sys->i_fps_num, &p_sys->i_fps_den);
-        free(psz_fps);
-    }
-
-    if (p_sys->i_depth != 10)
-    {
-        msg_Err(p_demux, "unsupported st2110-depth=%u (only 10 is supported)", p_sys->i_depth);
-        goto error;
-    }
-    if (!p_sys->psz_sampling || strcmp(p_sys->psz_sampling, "YCbCr-4:2:2") != 0)
-    {
-        msg_Err(p_demux, "unsupported st2110-sampling (only YCbCr-4:2:2 is supported)");
-        goto error;
-    }
-    if (p_sys->i_width == 0 || (p_sys->i_width % 2) != 0 || p_sys->i_height == 0)
-    {
-        msg_Err(p_demux, "invalid st2110-width/st2110-height");
-        goto error;
-    }
-    p_sys->fd = net_OpenDgram(p_this, psz_group, i_port,
-                               (p_sys->psz_source && *p_sys->psz_source) ? p_sys->psz_source : NULL,
-                               0, IPPROTO_UDP);
-    if (p_sys->fd < 0)
-    {
-        msg_Err(p_demux, "failed to open multicast socket %s:%d", psz_group, i_port);
-        goto error;
-    }
-    {
-        int i_rcvbuf = 32 * 1024 * 1024;
-        setsockopt(p_sys->fd, SOL_SOCKET, SO_RCVBUF, (const char *)&i_rcvbuf, sizeof(i_rcvbuf));
-    }
-    /* No SO_RCVTIMEO here: ReceiveThread() times out receive waits itself
-     * via select(), which needs no socket-level timeout configured. */
-
-    p_sys->i_stride_packed = (size_t)(p_sys->i_width / 2) * 5;
-    p_sys->i_buf_size      = p_sys->i_stride_packed * (size_t)p_sys->i_height;
-    /* calloc, not malloc: the first frame accumulated has no prior
-     * ResetFrameBuffer() call to zero it, so any line never received
-     * before the first flush would otherwise show as uninitialized
-     * heap garbage instead of black. */
-    p_sys->p_buf           = calloc(1, p_sys->i_buf_size);
-    p_sys->p_line_filled   = calloc(p_sys->i_height, sizeof(bool));
-    if (!p_sys->p_buf || !p_sys->p_line_filled)
-        goto error;
-    p_sys->i_last_no_frame_log = mdate();
-
-    p_sys->i_pts_delay = (mtime_t)var_InheritInteger(p_demux, "network-caching") * INT64_C(1000);
-    if (p_sys->i_pts_delay <= 0)
-        p_sys->i_pts_delay = INT64_C(200000); /* 200ms default, matches Lua extension's default */
-
-    es_format_t fmt;
-    es_format_Init(&fmt, VIDEO_ES, VLC_CODEC_I422_10L);
-    fmt.video.i_width  = fmt.video.i_visible_width  = p_sys->i_width;
-    fmt.video.i_height = fmt.video.i_visible_height = p_sys->i_height;
-    fmt.video.i_sar_num = fmt.video.i_sar_den = 1;
-    fmt.video.i_frame_rate      = p_sys->i_fps_num;
-    fmt.video.i_frame_rate_base = p_sys->i_fps_den;
-    SetColorimetry(&fmt.video, p_sys->psz_colorimetry, p_sys->psz_tcs);
-
-    p_sys->es = es_out_Add(p_demux->out, &fmt);
-    if (!p_sys->es)
-        goto error;
-
-    /* No pf_demux: ReceiveThread runs on its own and pushes to es_out_Send()
-     * directly, matching modules/access/rtp/rtp.c. */
-    p_demux->pf_demux   = NULL;
-    p_demux->pf_control = Control;
-
-    if (vlc_clone(&p_sys->thread, ReceiveThread, p_demux, VLC_THREAD_PRIORITY_INPUT))
-    {
-        msg_Err(p_demux, "failed to start receive thread");
-        goto error;
-    }
-    p_sys->thread_ready = true;
-
-    return VLC_SUCCESS;
-
-error:
-    Close(p_this);
-    return VLC_EGENERIC;
-}
-
-static void Close(vlc_object_t *p_this)
-{
-    demux_t     *p_demux = (demux_t *)p_this;
-    demux_sys_t *p_sys   = p_demux->p_sys;
-
-    if (!p_sys)
-        return;
-
-    /* Stop and join the thread before touching anything it might still be
-     * using (the socket, the frame buffer, es_out). */
-    if (p_sys->thread_ready)
-    {
-        vlc_cancel(p_sys->thread);
-        vlc_join(p_sys->thread, NULL);
-    }
-
-    if (p_sys->fd >= 0)
-        net_Close(p_sys->fd);
-
-    free(p_sys->psz_source);
-    free(p_sys->psz_sampling);
-    free(p_sys->psz_colorimetry);
-    free(p_sys->psz_tcs);
-    free(p_sys->p_buf);
-    free(p_sys->p_line_filled);
-    free(p_sys);
-    p_demux->p_sys = NULL;
-}
-
-/* Runs for the lifetime of the stream (vlc_clone()'d from Open(), stopped
- * via vlc_cancel()+vlc_join() in Close()): reads packets, and whenever one
- * full frame is assembled (marker bit, or for progressive a timestamp
- * change revealing the previous frame's marker was lost), pushes it with
- * es_out_Send() directly -- there is no caller to return frames to one at a
- * time. Matches modules/access/rtp/rtp.c's rtp_dgram_thread(): pf_demux is
- * not used for a live network source here (see Open()).
- *
- * Owns the socket I/O directly (select() then recv()) rather than going
- * through net_Read(), for the same reason rtp_dgram_thread() uses raw
- * poll()+recvmsg(): a plain OS-level timeout has no VLC-internal machinery
- * to second-guess. vlc_savecancel()/vlc_restorecancel() bracket each
- * iteration's processing (mirroring rtp_dgram_thread()), so a pending
- * vlc_cancel() is only acted on while blocked in select(), never mid-frame. */
+/* Dedicated receive thread. VLC's own RTP module (modules/access/rtp/rtp.c)
+ * uses this same pattern for live network sources: pf_demux is left NULL and
+ * a vlc_clone()'d thread pushes blocks to es_out asynchronously, rather than
+ * the core polling pf_demux. poll() here resolves to vlc_poll() (see
+ * vlc_threads.h), which is VLC's cancellation-aware wrapper -- raw select()
+ * has no such wrapper and would make Close()'s vlc_join() hang forever. */
 static void *ReceiveThread(void *data)
 {
-    demux_t     *p_demux = data;
-    demux_sys_t *p_sys   = p_demux->p_sys;
-    uint8_t pkt[9000];
+    demux_t *p_demux = data;
+    demux_sys_t *p_sys = p_demux->p_sys;
+    uint8_t pkt[RECV_BUF_LEN];
+    struct pollfd ufd;
 
-    for (;;)
-    {
-        /* poll(), not select(): vlc_threads.h #defines poll to its own
-         * vlc_poll(), which is what actually makes this call respond to
-         * vlc_cancel() -- select() has no such substitution anywhere in
-         * VLC, so a thread blocked in raw select() never notices being
-         * cancelled at all, and Close()'s vlc_join() then hangs forever
-         * (Stop stops responding). modules/access/rtp/rtp.c's own
-         * rtp_dgram_thread() uses poll() for exactly this reason. */
-        struct pollfd ufd = { .fd = p_sys->fd, .events = POLLIN };
-        int r = poll(&ufd, 1, 1000 /* ms */);
+    ufd.fd = p_sys->fd;
+    ufd.events = POLLIN;
+
+    p_sys->i_stat_window_start = mdate();
+
+    for (;;) {
+        int ret = poll(&ufd, 1, 1000);
+        if (ret < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
 
         int canc = vlc_savecancel();
 
-        if (r == 0)
-        {
+        if (ret == 0) {
             p_sys->i_idle_polls++;
-            /* log roughly every 10s of total silence, not every 1s poll,
-             * to stay well clear of the message-flood failure mode this
-             * module hit before (see WriteLines). */
-            if (p_sys->i_idle_polls % 10 == 1)
-                msg_Warn(p_demux, "no data received in %us on %s:%d (SSM source \"%s\") "
-                          "-- check multicast routing/PIM-SSM reachability from this host",
-                          p_sys->i_idle_polls, p_sys->psz_group, p_sys->i_port,
-                          (p_sys->psz_source && *p_sys->psz_source) ? p_sys->psz_source : "(none/ASM)");
-            vlc_restorecancel(canc);
-            continue;
-        }
-        if (r < 0)
-        {
-            vlc_restorecancel(canc);
-            break; /* socket error */
-        }
-
-        p_sys->i_idle_polls = 0;
-
-        ssize_t n = recv(p_sys->fd, (char *)pkt, sizeof(pkt), 0);
-        if (n < 0)
-        {
-            /* select() said readable but the actual read still failed: a
-             * genuine socket error, not a timeout (select() already owns
-             * all timeout handling above). */
-            vlc_restorecancel(canc);
-            break;
-        }
-        if (n == 0)
-        {
+            if (p_sys->i_idle_polls % 10 == 0)
+                msg_Warn(p_demux, "st2110: no data received for ~%us", p_sys->i_idle_polls);
             vlc_restorecancel(canc);
             continue;
         }
 
+        ssize_t len = recv(p_sys->fd, (char *)pkt, sizeof(pkt), 0);
+        if (len <= 0) {
+            vlc_restorecancel(canc);
+            continue;
+        }
         p_sys->i_pkts_total++;
 
-        uint32_t       ts = 0;
-        bool           marker = false;
-        const uint8_t *payload = NULL;
-        size_t         payload_len = 0;
-        bool rtp_ok = ParseRTP(pkt, (size_t)n, &ts, &marker, &payload, &payload_len);
-        if (!rtp_ok)
+        unsigned hdr_len;
+        uint32_t ts;
+        bool marker;
+        if (ParseRTP(pkt, (size_t)len, &hdr_len, &ts, &marker) != 0) {
             p_sys->i_pkts_rtp_fail++;
+            vlc_restorecancel(canc);
+            continue;
+        }
 
-        line_hdr_t     lines[MAX_LINE_HDRS];
-        unsigned       n_lines = 0;
-        const uint8_t *pixels = NULL;
-        size_t         pixels_len = 0;
-        bool lines_ok = rtp_ok
-                       && ParseLineHeaders(payload, payload_len, lines, &n_lines, &pixels, &pixels_len);
-        if (rtp_ok && !lines_ok)
+        const uint8_t *payload = pkt + hdr_len;
+        size_t payload_len = (size_t)len - hdr_len;
+        if (payload_len < RFC4175_EXT_SEQ_LEN) {
             p_sys->i_pkts_line_fail++;
-        if (lines_ok)
-            p_sys->i_pkts_no_frame++;
-
-        /* Every received packet is now accounted for in exactly one of
-         * these counters (or a completed frame reset them all -- see the
-         * es_out_Send call sites below), so this fires every ~5s no matter
-         * which stage is actually the problem: silently discarding packets
-         * before this point (as the old single-counter version did) is
-         * exactly the failure mode that hid a systematic parse rejection. */
-        mtime_t now = mdate();
-        if (now - p_sys->i_last_no_frame_log > INT64_C(5000000) /* 5s */)
-        {
-            msg_Warn(p_demux, "last ~5s: %u packets received, %u failed RTP header parse, "
-                      "%u failed line-header parse, %u parsed OK but no frame completed yet",
-                      p_sys->i_pkts_total, p_sys->i_pkts_rtp_fail,
-                      p_sys->i_pkts_line_fail, p_sys->i_pkts_no_frame);
-            p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = p_sys->i_pkts_line_fail
-                                 = p_sys->i_pkts_no_frame = 0;
-            p_sys->i_last_no_frame_log = now;
+            vlc_restorecancel(canc);
+            continue;
         }
+        payload += RFC4175_EXT_SEQ_LEN;
+        payload_len -= RFC4175_EXT_SEQ_LEN;
 
-        if (!lines_ok)
-        {
+        rfc4175_line_hdr_t hdrs[MAX_LINE_SEGMENTS];
+        unsigned n_hdrs;
+        size_t hdr_bytes;
+        if (ParseLineHeaders(payload, payload_len, hdrs, MAX_LINE_SEGMENTS,
+                              &n_hdrs, &hdr_bytes) != 0) {
+            p_sys->i_pkts_line_fail++;
             vlc_restorecancel(canc);
             continue;
         }
 
-        if (p_sys->b_interlace)
-        {
-            /* Each field carries its own RTP timestamp, so unlike the
-             * progressive path there's no single "current frame timestamp"
-             * to detect a lost marker against; a field is only considered
-             * done once its own marker arrives. Both fields weave into the
-             * same buffer (WriteLines maps line*2+F), and the full picture
-             * is sent once both top and bottom have each been marker-
-             * terminated since the last flush -- in whichever order they
-             * arrive. This does not recover from a lost field marker. */
-            WriteLines(p_demux, lines, n_lines, pixels, pixels_len);
+        DetectLineMode(p_demux, p_sys, hdrs, n_hdrs);
 
-            if (marker && n_lines > 0)
-            {
-                unsigned field = lines[n_lines - 1].field2 ? 1 : 0;
-                p_sys->b_field_seen[field] = true;
+        bool saw_field2 = WriteLines(p_sys, hdrs, n_hdrs,
+                                      payload + hdr_bytes, payload_len - hdr_bytes);
+        if (saw_field2)
+            p_sys->b_seen_field2_pkt = true;
 
-                if (p_sys->b_field_seen[0] && p_sys->b_field_seen[1])
-                {
-                    block_t *cur = FinalizeFrame(p_demux);
-                    ResetFrameBuffer(p_sys);
-                    p_sys->b_field_seen[0] = p_sys->b_field_seen[1] = false;
-                    if (cur)
-                    {
-                        p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = p_sys->i_pkts_line_fail
-                                             = p_sys->i_pkts_no_frame = 0;
-                        es_out_Send(p_demux->out, p_sys->es, cur);
-                    }
-                    /* if cur is NULL: frame dropped (too few lines received) */
-                }
-            }
-            vlc_restorecancel(canc);
-            continue;
+        if (marker && (!p_sys->b_interlace || p_sys->b_seen_field2_pkt)) {
+            FinalizeFrame(p_demux, p_sys);
+            p_sys->b_seen_field2_pkt = false;
         }
 
-        block_t *to_send = NULL;
-
-        if (p_sys->b_frame_open && ts != p_sys->i_frame_ts)
-        {
-            to_send = FinalizeFrame(p_demux);
-            ResetFrameBuffer(p_sys);
-            p_sys->b_frame_open = false;
-        }
-
-        if (!p_sys->b_frame_open)
-        {
-            p_sys->i_frame_ts   = ts;
-            p_sys->b_frame_open = true;
-        }
-
-        WriteLines(p_demux, lines, n_lines, pixels, pixels_len);
-
-        if (to_send)
-        {
-            p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = p_sys->i_pkts_line_fail
-                                 = p_sys->i_pkts_no_frame = 0;
-            es_out_Send(p_demux->out, p_sys->es, to_send);
-        }
-
-        if (marker)
-        {
-            block_t *cur = FinalizeFrame(p_demux);
-            ResetFrameBuffer(p_sys);
-            p_sys->b_frame_open = false;
-            if (cur)
-            {
-                p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = p_sys->i_pkts_line_fail
-                                     = p_sys->i_pkts_no_frame = 0;
-                es_out_Send(p_demux->out, p_sys->es, cur);
-            }
-            /* if cur is NULL: frame dropped (too few lines received) */
+        if (mdate() - p_sys->i_stat_window_start > 5 * CLOCK_FREQ) {
+            if (p_sys->i_pkts_rtp_fail || p_sys->i_pkts_line_fail || p_sys->i_pkts_no_frame)
+                msg_Warn(p_demux, "st2110: pkts=%u rtp_fail=%u line_fail=%u no_frame=%u",
+                         p_sys->i_pkts_total, p_sys->i_pkts_rtp_fail,
+                         p_sys->i_pkts_line_fail, p_sys->i_pkts_no_frame);
+            p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = 0;
+            p_sys->i_pkts_line_fail = p_sys->i_pkts_no_frame = 0;
+            p_sys->i_idle_polls = 0;
+            p_sys->i_stat_window_start = mdate();
         }
 
         vlc_restorecancel(canc);
     }
+
     return NULL;
 }
 
-static int Control(demux_t *p_demux, int i_query, va_list args)
+static int Control(demux_t *p_demux, int query, va_list args)
 {
-    demux_sys_t *p_sys = p_demux->p_sys;
-
-    switch (i_query)
-    {
+    switch (query) {
         case DEMUX_CAN_PAUSE:
         case DEMUX_CAN_SEEK:
-            *va_arg(args, bool *) = false;
-            return VLC_SUCCESS;
-
+        /* A live real-time source paces itself; VLC's own dvb/dtv access
+           modules return false here for the same reason (verified against
+           modules/access/dvb/access.c and modules/access/dtv/access.c). */
         case DEMUX_CAN_CONTROL_PACE:
-            /* false: this is a live real-time source (matches modules/access/dvb
-             * and dtv in real VLC), not a file the core can pull ahead of and
-             * pace against PTS itself -- we already only deliver data as fast
-             * as the network provides it. */
             *va_arg(args, bool *) = false;
             return VLC_SUCCESS;
 
         case DEMUX_GET_PTS_DELAY:
-            *va_arg(args, int64_t *) = p_sys->i_pts_delay;
+            *va_arg(args, int64_t *) =
+                INT64_C(1000) * var_InheritInteger(p_demux, "network-caching");
             return VLC_SUCCESS;
 
         case DEMUX_SET_PAUSE_STATE:
@@ -893,4 +544,137 @@ static int Control(demux_t *p_demux, int i_query, va_list args)
         default:
             return VLC_EGENERIC;
     }
+}
+
+static int Open(vlc_object_t *obj)
+{
+    demux_t *p_demux = (demux_t *)obj;
+    demux_sys_t *p_sys = calloc(1, sizeof(*p_sys));
+    if (!p_sys)
+        return VLC_ENOMEM;
+    p_demux->p_sys = p_sys;
+    p_sys->fd = -1;
+
+    /* MRL is st2110://<group>:<port>; psz_location has the scheme already
+       stripped by VLC's URL parser. */
+    const char *psz_loc = p_demux->psz_location;
+    const char *psz_colon = psz_loc ? strrchr(psz_loc, ':') : NULL;
+    if (!psz_loc || !psz_colon || psz_colon == psz_loc) {
+        msg_Err(p_demux, "st2110: expected st2110://<group>:<port>, got \"%s\"",
+                psz_loc ? psz_loc : "");
+        goto error;
+    }
+    size_t host_len = (size_t)(psz_colon - psz_loc);
+    if (host_len >= sizeof(p_sys->psz_group)) {
+        msg_Err(p_demux, "st2110: group address too long");
+        goto error;
+    }
+    memcpy(p_sys->psz_group, psz_loc, host_len);
+    p_sys->psz_group[host_len] = '\0';
+
+    p_sys->i_port = atoi(psz_colon + 1);
+    if (p_sys->i_port <= 0 || p_sys->i_port > 65535) {
+        msg_Err(p_demux, "st2110: invalid port in \"%s\"", psz_loc);
+        goto error;
+    }
+
+    p_sys->psz_source  = var_InheritString(p_demux, "st2110-source");
+    p_sys->i_width     = var_InheritInteger(p_demux, "st2110-width");
+    p_sys->i_height    = var_InheritInteger(p_demux, "st2110-height");
+    p_sys->i_depth     = var_InheritInteger(p_demux, "st2110-depth");
+    p_sys->b_interlace = var_InheritBool(p_demux, "st2110-interlace");
+    if (p_sys->i_width == 0)  p_sys->i_width  = DEFAULT_WIDTH;
+    if (p_sys->i_height == 0) p_sys->i_height = DEFAULT_HEIGHT;
+    if (p_sys->i_depth == 0)  p_sys->i_depth  = 10;
+
+    if (p_sys->i_depth != 10) {
+        msg_Err(p_demux, "st2110: only 10bit GPM is supported (st2110-depth=%u)", p_sys->i_depth);
+        goto error;
+    }
+
+    char *psz_fps = var_InheritString(p_demux, "st2110-fps");
+    ParseFraction(psz_fps, &p_sys->i_fps_num, &p_sys->i_fps_den);
+    free(psz_fps);
+
+    char *psz_sampling = var_InheritString(p_demux, "st2110-sampling");
+    if (psz_sampling && strcmp(psz_sampling, "YCbCr-4:2:2") != 0)
+        msg_Warn(p_demux, "st2110: only YCbCr-4:2:2 is implemented (got \"%s\"), proceeding anyway",
+                 psz_sampling);
+    free(psz_sampling);
+
+    p_sys->fd = net_OpenDgram(p_demux, p_sys->psz_group, p_sys->i_port,
+                               p_sys->psz_source, 0, IPPROTO_UDP);
+    if (p_sys->fd == -1) {
+        msg_Err(p_demux, "st2110: failed to join %s:%d", p_sys->psz_group, p_sys->i_port);
+        goto error;
+    }
+    int rcvbuf = SO_RCVBUF_SIZE;
+    setsockopt(p_sys->fd, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
+
+    p_sys->i_y_plane_size  = (size_t)p_sys->i_width * p_sys->i_height * 2;
+    p_sys->i_uv_plane_size = (size_t)(p_sys->i_width / 2) * p_sys->i_height * 2;
+    p_sys->i_buf_size = p_sys->i_y_plane_size + 2 * p_sys->i_uv_plane_size;
+    p_sys->p_buf = calloc(1, p_sys->i_buf_size);
+    p_sys->p_line_filled = calloc(p_sys->i_height, sizeof(bool));
+    if (!p_sys->p_buf || !p_sys->p_line_filled)
+        goto error;
+
+    es_format_t fmt;
+    es_format_Init(&fmt, VIDEO_ES, VLC_CODEC_I422_10L);
+    fmt.video.i_width  = fmt.video.i_visible_width  = p_sys->i_width;
+    fmt.video.i_height = fmt.video.i_visible_height = p_sys->i_height;
+    fmt.video.i_sar_num = fmt.video.i_sar_den = 1;
+    fmt.video.i_frame_rate      = p_sys->i_fps_num;
+    fmt.video.i_frame_rate_base = p_sys->i_fps_den;
+    char *psz_colorimetry = var_InheritString(p_demux, "st2110-colorimetry");
+    SetColorimetry(&fmt.video, psz_colorimetry);
+    free(psz_colorimetry);
+
+    p_sys->p_es = es_out_Add(p_demux->out, &fmt);
+    es_format_Clean(&fmt);
+    if (!p_sys->p_es)
+        goto error;
+
+    date_Init(&p_sys->pts, p_sys->i_fps_num, p_sys->i_fps_den);
+    date_Set(&p_sys->pts, VLC_TS_0);
+
+    p_demux->pf_demux = NULL;      /* live source: pushed asynchronously by ReceiveThread */
+    p_demux->pf_control = Control;
+
+    msg_Info(p_demux, "st2110: %s:%d %ux%u interlace=%d fps=%u/%u",
+             p_sys->psz_group, p_sys->i_port, p_sys->i_width, p_sys->i_height,
+             p_sys->b_interlace, p_sys->i_fps_num, p_sys->i_fps_den);
+
+    if (vlc_clone(&p_sys->thread, ReceiveThread, p_demux, VLC_THREAD_PRIORITY_INPUT)) {
+        msg_Err(p_demux, "st2110: failed to spawn receive thread");
+        goto error;
+    }
+    p_sys->b_thread_started = true;
+
+    return VLC_SUCCESS;
+
+error:
+    Close(obj);
+    return VLC_EGENERIC;
+}
+
+static void Close(vlc_object_t *obj)
+{
+    demux_t *p_demux = (demux_t *)obj;
+    demux_sys_t *p_sys = p_demux->p_sys;
+    if (!p_sys)
+        return;
+
+    if (p_sys->b_thread_started) {
+        vlc_cancel(p_sys->thread);
+        vlc_join(p_sys->thread, NULL);
+    }
+    if (p_sys->fd != -1)
+        net_Close(p_sys->fd);
+
+    free(p_sys->psz_source);
+    free(p_sys->p_buf);
+    free(p_sys->p_line_filled);
+    free(p_sys);
+    p_demux->p_sys = NULL;
 }
