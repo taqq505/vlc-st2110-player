@@ -195,14 +195,17 @@ struct demux_sys_t
     atomic_bool *p_line_filled;   /* written by multiple workers concurrently */
     atomic_uint  i_lines_filled;
 
-    /* Field/frame boundary detection for interlace (see ReceiveThread):
+    /* Field/frame boundary detection for interlace (see ProcessPacket):
        driven by RTP timestamp changes rather than the marker bit, since
        RFC4175 guarantees every packet of a field shares one timestamp,
-       while marker-bearing packets can be lost or reordered. Touched only
-       by the (single) receive thread, so plain types are fine. */
-    bool     b_accum_started;
-    uint32_t i_accum_ts;
-    unsigned i_field_count;
+       while marker-bearing packets can be lost or reordered. Remembers
+       BOTH of the current frame's field timestamps (not just a change
+       count) so that ordinary network reordering -- a stray packet from
+       the field just finishing arriving after the next field has already
+       started -- can't be misread as the start of a third field. Touched
+       only by the (single) receive thread, so plain types are fine. */
+    uint32_t ts_seen[2];
+    unsigned n_ts_seen;
 
     /* per-frame drop counters, reset after each finalized/dropped frame;
        written from multiple workers concurrently, hence atomic */
@@ -719,25 +722,24 @@ static void ProcessPacket(demux_t *p_demux, demux_sys_t *p_sys, batch_state_t *b
         /* Field/frame boundaries are delimited by RTP timestamp changes
            (RFC4175: every packet of one field shares one timestamp), not
            by the marker bit -- a lost or reordered marker packet must not
-           be able to desync the field count. Two distinct timestamps =
-           one complete interlaced frame (field one, field two); the third
-           distinct timestamp means the next frame has started, so
-           finalize before folding its data in. */
-        if (!p_sys->b_accum_started) {
-            p_sys->b_accum_started = true;
-            p_sys->i_accum_ts = ts;
-            p_sys->i_field_count = 1;
-        } else if (ts != p_sys->i_accum_ts) {
-            p_sys->i_accum_ts = ts;
-            p_sys->i_field_count++;
-            if (p_sys->i_field_count > 2) {
+           be able to desync the field count. A frame is exactly two
+           distinct timestamps (field one, field two); a packet carrying
+           either of the two ALREADY-SEEN timestamps for this frame is
+           just ordinary reordering and must not be mistaken for a third
+           field starting -- only a genuinely new (third) timestamp, seen
+           after two are already known, means the next frame has begun. */
+        bool b_known = (p_sys->n_ts_seen >= 1 && ts == p_sys->ts_seen[0])
+                     || (p_sys->n_ts_seen >= 2 && ts == p_sys->ts_seen[1]);
+        if (!b_known) {
+            if (p_sys->n_ts_seen >= 2) {
                 /* This packet belongs to the new field/frame, so it must
                    not be in the batch being flushed here. */
                 FlushBatch(batch);
                 DrainAllWorkers(p_sys);
                 FinalizeFrame(p_demux, p_sys);
-                p_sys->i_field_count = 1;
+                p_sys->n_ts_seen = 0;
             }
+            p_sys->ts_seen[p_sys->n_ts_seen++] = ts;
         }
         AddToBatch(p_sys, batch, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
     } else {
