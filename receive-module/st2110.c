@@ -637,18 +637,21 @@ static void *SenderThread(void *data)
     demux_t *p_demux = data;
     demux_sys_t *p_sys = p_demux->p_sys;
     mtime_t frame_interval = (mtime_t)CLOCK_FREQ * p_sys->i_fps_den / p_sys->i_fps_num;
-    mtime_t next_tick = mdate();
-    mtime_t stat_window_start = next_tick;
+    mtime_t stat_window_start = mdate();
 
     for (;;) {
         if (atomic_load(&p_sys->b_stop_requested))
             break;
 
-        next_tick += frame_interval;
-        mtime_t now = mdate();
-        if (next_tick < now)
-            next_tick = now; /* fell behind: resync rather than bursting to catch up */
-        mwait(next_tick);
+        /* A plain relative sleep, not "wait until an absolute deadline":
+           the latter can degenerate into a busy spin (zero actual wait)
+           if any single iteration -- e.g. es_out_Send() blocking on a
+           congested decoder fifo -- ever takes longer than one frame
+           interval, since the next deadline would already be in the past
+           by the time it's computed. A relative sleep always waits at
+           least close to frame_interval no matter how the previous
+           iteration went. */
+        msleep(frame_interval);
 
         if (atomic_load(&p_sys->b_stop_requested))
             break;
@@ -764,9 +767,16 @@ static int Open(vlc_object_t *obj)
     free(psz_sampling);
 
     /* How many I/O threads: an explicit st2110-threads option always wins;
-       otherwise auto-detect from the CPU count, reserving one core for
-       VLC's own decode/convert/render pipeline (and the OS) so this
-       module's reception work can't starve it -- these threads run at
+       otherwise auto-detect from the CPU count, reserving TWO cores (not
+       just one) -- one for VLC's own decode/convert/render pipeline, and
+       one extra as slack for whatever core the NIC driver's RSS/DPC
+       processing is pinned to (Windows RSS deliberately keeps all receive
+       processing for a single flow, like our one multicast stream, on
+       one fixed core -- see the file header comment -- and a Windows
+       driver on at least one tested adapter didn't report which core via
+       the usual query, so this can't be targeted precisely; leaving extra
+       headroom instead gives the OS scheduler more room to avoid
+       whichever core that turns out to be). These threads run at
        elevated priority below, since (unlike the old design) they now do
        the full, latency-critical receive+unpack pipeline themselves. */
     int i_threads_opt = var_InheritInteger(p_demux, "st2110-threads");
@@ -774,7 +784,7 @@ static int Open(vlc_object_t *obj)
         p_sys->n_threads = (unsigned)i_threads_opt;
     } else {
         unsigned n_cpu = DetectCpuCount();
-        p_sys->n_threads = n_cpu > 1 ? n_cpu - 1 : 1;
+        p_sys->n_threads = n_cpu > 2 ? n_cpu - 2 : 1;
     }
 
     p_sys->fd = net_OpenDgram(p_demux, p_sys->psz_group, p_sys->i_port,
