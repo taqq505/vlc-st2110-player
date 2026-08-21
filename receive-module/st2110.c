@@ -36,6 +36,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <limits.h>
 
 #ifndef _WIN32
 # include <poll.h>
@@ -290,6 +291,15 @@ struct demux_sys_t
        0-539 range -- i.e. a mapping bug, not packet loss (loss would show
        up as low i_hdrs_total or nonzero drop counters, not this). */
     atomic_uint i_hdrs_dup_line;
+
+    /* Per-cycle min/max of the raw wire line_no actually seen, split by
+       field ([0]=field one, [1]=field two). Reset every FinalizeFrame.
+       Diagnostic: reveals whether line_no really spans the full expected
+       0-(height/2-1) range every cycle, or is clustering into a narrower
+       band -- which a stably-high dup_line rate alone can't distinguish
+       from the normal "~2-3 packets needed per line" pattern. */
+    atomic_uint line_no_min[2];
+    atomic_uint line_no_max[2];
 };
 
 static int  Open(vlc_object_t *);
@@ -501,6 +511,18 @@ static bool MapLine(const demux_sys_t *p_sys, const rfc4175_line_hdr_t *h,
     return true;
 }
 
+static void TrackLineNoRange(demux_sys_t *p_sys, unsigned field_idx, unsigned line_no)
+{
+    unsigned cur = atomic_load(&p_sys->line_no_min[field_idx]);
+    while (line_no < cur
+        && !atomic_compare_exchange_weak(&p_sys->line_no_min[field_idx], &cur, line_no))
+        ;
+    cur = atomic_load(&p_sys->line_no_max[field_idx]);
+    while (line_no > cur
+        && !atomic_compare_exchange_weak(&p_sys->line_no_max[field_idx], &cur, line_no))
+        ;
+}
+
 /* Unpacks RFC4175 YCbCr-4:2:2 10bit GPM pgroups (5 bytes -> Cb,Y0,Cr,Y1)
  * directly into the current output block's Y/U/V planes. */
 static void WriteLines(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
@@ -547,6 +569,8 @@ static void WriteLines(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
             off += h->length;
             continue;
         }
+        if (p_sys->b_interlace)
+            TrackLineNoRange(p_sys, h->field2 ? 1 : 0, h->line_no);
 
         unsigned n_pgroups = h->length / 5;
         const uint8_t *seg = data + off;
@@ -872,12 +896,24 @@ static void CheckStatsWindow(demux_t *p_demux, demux_sys_t *p_sys)
         msg_Warn(p_demux, "st2110: pkts=%u rtp_fail=%u line_fail=%u no_frame=%u",
                  p_sys->i_pkts_total, p_sys->i_pkts_rtp_fail,
                  p_sys->i_pkts_line_fail, p_sys->i_pkts_no_frame);
-    if (p_sys->b_interlace)
+    if (p_sys->b_interlace) {
         msg_Warn(p_demux, "st2110: line headers total=%u field2=%u (%.1f%%) dup_line=%u (%.1f%%)",
                  p_sys->i_hdrs_total, p_sys->i_hdrs_field2,
                  p_sys->i_hdrs_total ? 100.0 * p_sys->i_hdrs_field2 / p_sys->i_hdrs_total : 0.0,
                  p_sys->i_hdrs_dup_line,
                  p_sys->i_hdrs_total ? 100.0 * p_sys->i_hdrs_dup_line / p_sys->i_hdrs_total : 0.0);
+        /* Window-level (covers every frame, passing or failing -- unlike
+           the per-frame log above, which only fires on failure) range of
+           the raw wire line_no actually seen. Reveals whether line_no
+           really spans the full expected 0-(height/2-1) every cycle, or
+           clusters into a narrower band even for "successful" frames. */
+        msg_Warn(p_demux, "st2110: wire line_no range this window: field1=[%u..%u] field2=[%u..%u] (expected [0..%u])",
+                 p_sys->line_no_min[0], p_sys->line_no_max[0],
+                 p_sys->line_no_min[1], p_sys->line_no_max[1],
+                 p_sys->i_height / 2 - 1);
+        p_sys->line_no_min[0] = p_sys->line_no_min[1] = UINT_MAX;
+        p_sys->line_no_max[0] = p_sys->line_no_max[1] = 0;
+    }
     p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = 0;
     p_sys->i_pkts_line_fail = p_sys->i_pkts_no_frame = 0;
     p_sys->i_hdrs_total = p_sys->i_hdrs_field2 = p_sys->i_hdrs_dup_line = 0;
@@ -1185,6 +1221,10 @@ static int Open(vlc_object_t *obj)
 
     date_Init(&p_sys->pts, p_sys->i_fps_num, p_sys->i_fps_den);
     date_Set(&p_sys->pts, VLC_TS_0);
+
+    /* calloc() zeroed these, but 0 is the wrong sentinel for a running
+       minimum -- start it high so the first real line_no always wins. */
+    p_sys->line_no_min[0] = p_sys->line_no_min[1] = UINT_MAX;
 
     p_demux->pf_demux = NULL;      /* live source: pushed asynchronously by ReceiveThread */
     p_demux->pf_control = Control;
