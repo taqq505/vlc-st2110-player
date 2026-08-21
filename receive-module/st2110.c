@@ -105,11 +105,25 @@ typedef struct {
 #define LINE_MODE_SDI_LEGACY_MIN    570
 #define LINE_MODE_DETECT_MIN_PKTS     8
 
+/* How many line headers to observe with F never set to 1 before concluding
+   the sender just doesn't set it (roughly one field's worth of headers for
+   a 1080-line raster at typical packet sizes, so a real field two isn't
+   mistaken for "never sent"). */
+#define FIELD_MODE_DETECT_MIN_HDRS 2000
+
 typedef enum {
     LINE_MODE_UNKNOWN = 0,
     LINE_MODE_ZERO_BASED,
     LINE_MODE_SDI_LEGACY,
 } line_mode_t;
+
+typedef enum {
+    FIELD_MODE_UNKNOWN = 0,
+    FIELD_MODE_F_BIT,     /* trust RFC4175's own F bit (the compliant path) */
+    FIELD_MODE_TS_ORDER,  /* F bit never set; use RTP-timestamp arrival
+                              order within the frame instead (see
+                              ProcessPacket) */
+} field_mode_t;
 
 typedef struct {
     uint16_t length;      /* segment length in bytes (raw, pgroup-packed)  */
@@ -207,6 +221,19 @@ struct demux_sys_t
     uint32_t ts_seen[2];
     unsigned n_ts_seen;
 
+    /* Which field a line header belongs to should come from RFC4175's own
+       F bit -- but some real SDI-to-IP gateways never set it (always 0),
+       likely because internally they track "current field" purely from
+       SDI waveform timing and never wire that through to the RFC4175
+       header. If that happens, every line would land on the SAME (even)
+       output rows via MapLine's weave, permanently losing the other half
+       of the picture. Auto-detected fallback: once a sender is seen never
+       setting F=1, switch to using RTP-timestamp arrival order instead
+       (see ProcessPacket) -- spec-guaranteed reliable either way, since
+       RFC4175 requires one timestamp per field regardless of F. */
+    field_mode_t field_mode;
+    unsigned     i_hdrs_seen_for_field_detect;
+
     /* per-frame drop counters, reset after each finalized/dropped frame;
        written from multiple workers concurrently, hence atomic */
     atomic_uint i_drop_field2;
@@ -246,6 +273,16 @@ struct demux_sys_t
     unsigned i_pkts_line_fail;
     unsigned i_pkts_no_frame;
     unsigned i_idle_polls;
+    /* How many line-header entries actually carried the RFC4175 F (field
+       two) bit, vs. total line-header entries seen -- written from
+       multiple workers concurrently, hence atomic. Diagnostic for
+       whether a sender is marking field two at all: if this stays at (or
+       near) zero while video is clearly interlaced, the sender likely
+       never sets F=1, which would explain a frame consistently landing
+       at ~half its lines (see MapLine's weave: everything would land on
+       even rows only). */
+    atomic_uint i_hdrs_total;
+    atomic_uint i_hdrs_field2;
 };
 
 static int  Open(vlc_object_t *);
@@ -404,6 +441,37 @@ static void DetectLineMode(demux_t *p_demux, demux_sys_t *p_sys,
     }
 }
 
+/* Some real SDI-to-IP gateways never set RFC4175's F bit (always 0),
+ * apparently because internally they track "current field" purely from
+ * SDI waveform timing (SMPTE 292M) and never wire that fact through to
+ * the RFC4175 header they emit. If every line lands on field one, MapLine
+ * weaves everything onto the same (even) output rows, permanently losing
+ * the other half of the picture -- so detect that and fall back to using
+ * RTP-timestamp arrival order instead (see ProcessPacket), which RFC4175
+ * guarantees is reliable regardless of what the sender does with F. */
+static void DetectFieldMode(demux_t *p_demux, demux_sys_t *p_sys,
+                             const rfc4175_line_hdr_t *hdrs, unsigned n)
+{
+    if (p_sys->field_mode != FIELD_MODE_UNKNOWN)
+        return;
+
+    for (unsigned i = 0; i < n; i++) {
+        if (hdrs[i].field2) {
+            p_sys->field_mode = FIELD_MODE_F_BIT;
+            msg_Info(p_demux, "st2110: sender sets the RFC4175 F bit; using it for field ordering");
+            return;
+        }
+    }
+
+    p_sys->i_hdrs_seen_for_field_detect += n;
+    if (p_sys->i_hdrs_seen_for_field_detect >= FIELD_MODE_DETECT_MIN_HDRS) {
+        p_sys->field_mode = FIELD_MODE_TS_ORDER;
+        msg_Warn(p_demux, "st2110: sender never set the RFC4175 F bit after %u line headers; "
+                 "falling back to RTP-timestamp arrival order to distinguish fields",
+                 p_sys->i_hdrs_seen_for_field_detect);
+    }
+}
+
 /* Maps a wire line header to the output picture's row index, normalizing
  * away the SDI-legacy base offset when detected, then weaving fields for
  * interlace (ST2110-20 6.1.5 Note 2: field two's rows are interleaved
@@ -445,6 +513,10 @@ static void WriteLines(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
 
     for (unsigned i = 0; i < n_hdrs; i++) {
         const rfc4175_line_hdr_t *h = &hdrs[i];
+
+        p_sys->i_hdrs_total++;
+        if (h->field2)
+            p_sys->i_hdrs_field2++;
 
         if (off + h->length > data_len) {
             p_sys->i_drop_stride++;
@@ -650,9 +722,25 @@ static void FinalizeFrame(demux_t *p_demux, demux_sys_t *p_sys)
        doesn't itself become a meaningful CPU cost at ~30-60 calls/sec. */
     if (p_sys->i_drop_field2 || p_sys->i_drop_offset || p_sys->i_drop_line_range
      || p_sys->i_drop_stride || !b_ok) {
-        msg_Warn(p_demux, "st2110: frame lines=%u/%u drop(field2=%u offset=%u range=%u stride=%u)",
-                 p_sys->i_lines_filled, p_sys->i_height, p_sys->i_drop_field2,
-                 p_sys->i_drop_offset, p_sys->i_drop_line_range, p_sys->i_drop_stride);
+        if (p_sys->b_interlace) {
+            /* Even rows = field one, odd rows = field two (see MapLine's
+               weave). Diagnostic: is the shortfall spread across both
+               fields, or is one field specifically missing? */
+            unsigned n_f1 = 0, n_f2 = 0;
+            for (unsigned line = 0; line < p_sys->i_height; line++) {
+                if (!p_sys->p_line_filled[line])
+                    continue;
+                if (line % 2 == 0) n_f1++; else n_f2++;
+            }
+            msg_Warn(p_demux, "st2110: frame lines=%u/%u (field1=%u/%u field2=%u/%u) drop(field2=%u offset=%u range=%u stride=%u)",
+                     p_sys->i_lines_filled, p_sys->i_height, n_f1, p_sys->i_height / 2,
+                     n_f2, p_sys->i_height / 2, p_sys->i_drop_field2,
+                     p_sys->i_drop_offset, p_sys->i_drop_line_range, p_sys->i_drop_stride);
+        } else {
+            msg_Warn(p_demux, "st2110: frame lines=%u/%u drop(field2=%u offset=%u range=%u stride=%u)",
+                     p_sys->i_lines_filled, p_sys->i_height, p_sys->i_drop_field2,
+                     p_sys->i_drop_offset, p_sys->i_drop_line_range, p_sys->i_drop_stride);
+        }
     }
 
     /* A sent block was already replaced above by a freshly zeroed one. A
@@ -741,6 +829,20 @@ static void ProcessPacket(demux_t *p_demux, demux_sys_t *p_sys, batch_state_t *b
             }
             p_sys->ts_seen[p_sys->n_ts_seen++] = ts;
         }
+
+        DetectFieldMode(p_demux, p_sys, hdrs, n_hdrs);
+        if (p_sys->field_mode == FIELD_MODE_TS_ORDER) {
+            /* F bit is unreliable on this sender: re-derive it from which
+               of the current frame's (up to two) known timestamps this
+               packet carries -- the first-seen group is field one, the
+               second-seen is field two. This is what MapLine's weave
+               reads, so overwriting it here is enough; nothing downstream
+               needs to know the fallback is in effect. */
+            bool ts_is_second = p_sys->n_ts_seen >= 2 && ts == p_sys->ts_seen[1];
+            for (unsigned i = 0; i < n_hdrs; i++)
+                hdrs[i].field2 = ts_is_second;
+        }
+
         AddToBatch(p_sys, batch, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
     } else {
         AddToBatch(p_sys, batch, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
@@ -761,8 +863,13 @@ static void CheckStatsWindow(demux_t *p_demux, demux_sys_t *p_sys)
         msg_Warn(p_demux, "st2110: pkts=%u rtp_fail=%u line_fail=%u no_frame=%u",
                  p_sys->i_pkts_total, p_sys->i_pkts_rtp_fail,
                  p_sys->i_pkts_line_fail, p_sys->i_pkts_no_frame);
+    if (p_sys->b_interlace)
+        msg_Warn(p_demux, "st2110: line headers total=%u field2=%u (%.1f%%)",
+                 p_sys->i_hdrs_total, p_sys->i_hdrs_field2,
+                 p_sys->i_hdrs_total ? 100.0 * p_sys->i_hdrs_field2 / p_sys->i_hdrs_total : 0.0);
     p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = 0;
     p_sys->i_pkts_line_fail = p_sys->i_pkts_no_frame = 0;
+    p_sys->i_hdrs_total = p_sys->i_hdrs_field2 = 0;
     p_sys->i_idle_polls = 0;
     p_sys->i_stat_window_start = mdate();
 }
