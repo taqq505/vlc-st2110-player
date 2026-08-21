@@ -18,12 +18,20 @@
  *     packet needs any information from any other packet to know where its
  *     pixels belong, and no "frame" or "field" bookkeeping is needed for
  *     correctness of placement.
- *   - So: N identical I/O threads all pull completions from one shared
- *     socket/IOCP, and each does the FULL pipeline itself (parse -> unpack
- *     -> write) directly into one persistent, never-cleared "master"
- *     picture buffer. Writes never need locking: two different packets'
- *     target byte ranges never overlap (different lines, or non-
- *     overlapping segments of the same line).
+ *   - So: N identical I/O threads each receive independently from the same
+ *     socket, and each does the FULL pipeline itself (parse -> unpack ->
+ *     write) directly into one persistent, never-cleared "master" picture
+ *     buffer. Writes never need locking: two different packets' target
+ *     byte ranges never overlap (different lines, or non-overlapping
+ *     segments of the same line).
+ *     On Windows this deliberately does NOT route all threads through one
+ *     shared IOCP: IOCP's completion dispatch favors waking the most
+ *     recently active thread (for cache locality), which under sustained
+ *     load left one thread doing nearly all the work while the others sat
+ *     comparatively idle (observed directly via Task Manager's per-core
+ *     view). Instead, each thread owns its own pool of overlapped
+ *     WSARecv() buffers/events and waits on those alone via
+ *     WaitForMultipleObjects(), which has no such affinity bias.
  *   - A single, independent sender thread ticks on its own clock (not
  *     driven by arrival timing at all) and periodically snapshots whatever
  *     is currently in the master buffer to es_out. Packet loss just means
@@ -83,11 +91,12 @@
 
 #define SO_RCVBUF_SIZE (32 * 1024 * 1024)
 
-/* Per-I/O-thread share of pre-posted overlapped receive buffers (Windows).
- * More threads draining the same IOCP means more buffers should be kept in
- * flight at once so none of them ever stalls waiting for a free one. */
-#define IOCP_BUFS_PER_THREAD    16
-#define IOCP_MAX_COMPLETIONS    64
+/* Overlapped WSARecv() buffers each Windows I/O thread keeps in flight on
+ * its own (see the file header comment for why each thread owns its own
+ * pool instead of sharing one IOCP). Must stay under MAXIMUM_WAIT_OBJECTS
+ * (64), since a thread waits on all of its own buffers' events at once via
+ * WaitForMultipleObjects(). */
+#define WIN_BUFS_PER_THREAD    16
 
 /*
  * SMPTE ST 2110-20:2017 6.1.5 defines the SRD Line No as zero-based. In
@@ -117,12 +126,15 @@ typedef struct {
 } rfc4175_line_hdr_t;
 
 #ifdef _WIN32
+/* One overlapped WSARecv() buffer, owned by exactly one I/O thread (never
+ * shared across threads). overlapped.hEvent is set once at creation and
+ * preserved across reposts. */
 typedef struct {
     OVERLAPPED overlapped;
     WSABUF     wsabuf;
     DWORD      flags;
     uint8_t    data[RECV_BUF_LEN];
-} iocp_buf_t;
+} win_recv_buf_t;
 #endif
 
 struct demux_sys_t
@@ -181,19 +193,12 @@ struct demux_sys_t
     vlc_thread_t sender_thread;
     bool         b_sender_started;
 
-    /* Cooperative shutdown signal: see the ReceiveThread-era comment this
-       carries forward from -- a blocked GetQueuedCompletionStatusEx() or
+    /* Cooperative shutdown signal: a blocked WaitForMultipleObjects()/
        poll() is not guaranteed to be interrupted by vlc_cancel() on every
        platform, so every wait loop here also checks this flag on its own
        bounded timeout, guaranteeing Close()'s vlc_join() calls can never
        hang. */
     atomic_bool  b_stop_requested;
-
-#ifdef _WIN32
-    HANDLE      iocp;
-    iocp_buf_t *iocp_bufs;
-    unsigned    n_iocp_bufs;
-#endif
 
     /* rolling diagnostics: written by any I/O thread (atomic), read and
        reset by the sender thread every ~5s */
@@ -496,67 +501,79 @@ static void ProcessPacket(demux_sys_t *p_sys, const uint8_t *pkt, size_t len)
 }
 
 #ifdef _WIN32
-/* Windows I/O thread: N of these all pull completions from the SAME
- * shared IOCP (the classic IOCP thread-pool pattern -- the OS load-
- * balances completions across however many threads are currently
- * waiting). Each does the full parse+unpack itself and reposts its
- * buffer immediately.
+/* Windows I/O thread: N of these each own an independent pool of
+ * WIN_BUFS_PER_THREAD overlapped WSARecv() buffers/events and wait only on
+ * their own (see the file header comment for why this avoids IOCP's
+ * cache-locality-biased dispatch). Each does the full parse+unpack itself
+ * and reposts its own buffer immediately.
  *
- * The wait is non-alertable and bounded (1000ms): shutdown does not rely
- * on vlc_cancel()'s APC reaching this thread (unverified whether VLC's
- * Windows thread implementation even delivers it here, and an alertable
- * wait risks spinning on unrelated APCs at a rate high enough to burn a
- * full core for no useful work). b_stop_requested plus this call's own
- * timeout guarantees the loop exits on its own. */
+ * The wait is bounded (1000ms) and, on cancellation, Close() also calls
+ * CancelIoEx() once (which cancels every thread's outstanding recv()s
+ * regardless of which thread issued them), so a waiting thread wakes
+ * promptly on shutdown rather than waiting out the full timeout. */
 static void *IoThread(void *data)
 {
     demux_t *p_demux = data;
     demux_sys_t *p_sys = p_demux->p_sys;
-    OVERLAPPED_ENTRY entries[IOCP_MAX_COMPLETIONS];
+
+    win_recv_buf_t *bufs = calloc(WIN_BUFS_PER_THREAD, sizeof(win_recv_buf_t));
+    HANDLE events[WIN_BUFS_PER_THREAD];
+    if (!bufs) {
+        msg_Err(p_demux, "st2110: I/O thread failed to allocate buffers");
+        return NULL;
+    }
+
+    for (unsigned i = 0; i < WIN_BUFS_PER_THREAD; i++) {
+        events[i] = CreateEvent(NULL, FALSE /* auto-reset */, FALSE, NULL);
+        bufs[i].overlapped.hEvent = events[i];
+        bufs[i].wsabuf.buf = (char *)bufs[i].data;
+        bufs[i].wsabuf.len = RECV_BUF_LEN;
+        int r = WSARecv((SOCKET)p_sys->fd, &bufs[i].wsabuf, 1, NULL, &bufs[i].flags,
+                         &bufs[i].overlapped, NULL);
+        if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
+            msg_Warn(p_demux, "st2110: WSARecv failed to post buffer %u (err=%d)", i, WSAGetLastError());
+    }
 
     for (;;) {
         if (atomic_load(&p_sys->b_stop_requested))
             break;
 
-        ULONG n = 0;
-        BOOL ok = GetQueuedCompletionStatusEx(p_sys->iocp, entries,
-                                               IOCP_MAX_COMPLETIONS, &n, 1000, FALSE);
+        DWORD w = WaitForMultipleObjects(WIN_BUFS_PER_THREAD, events, FALSE, 1000);
+        if (w == WAIT_TIMEOUT)
+            continue;
+        if (w < WAIT_OBJECT_0 || w >= WAIT_OBJECT_0 + WIN_BUFS_PER_THREAD)
+            break; /* WAIT_FAILED or abandoned: nothing more we can do here */
+
+        unsigned i = w - WAIT_OBJECT_0;
         int canc = vlc_savecancel();
 
-        if (!ok) {
-            if (GetLastError() != WAIT_TIMEOUT) {
-                vlc_restorecancel(canc);
-                break;
-            }
-            vlc_restorecancel(canc);
-            continue;
+        DWORD xfer = 0, flags = 0;
+        BOOL ok = WSAGetOverlappedResult((SOCKET)p_sys->fd, &bufs[i].overlapped, &xfer, FALSE, &flags);
+        if (ok && xfer > 0) {
+            atomic_fetch_add(&p_sys->i_pkts_total, 1);
+            ProcessPacket(p_sys, bufs[i].data, (size_t)xfer);
         }
 
-        for (ULONG e = 0; e < n; e++) {
-            iocp_buf_t *b = (iocp_buf_t *)CONTAINING_RECORD(entries[e].lpOverlapped,
-                                                              iocp_buf_t, overlapped);
-            DWORD xfer = entries[e].dwNumberOfBytesTransferred;
-
-            if (xfer > 0) {
-                atomic_fetch_add(&p_sys->i_pkts_total, 1);
-                ProcessPacket(p_sys, b->data, (size_t)xfer);
-            }
-
-            if (!atomic_load(&p_sys->b_stop_requested)) {
-                b->wsabuf.buf = (char *)b->data;
-                b->wsabuf.len = RECV_BUF_LEN;
-                b->flags = 0;
-                memset(&b->overlapped, 0, sizeof(b->overlapped));
-                int r = WSARecv((SOCKET)p_sys->fd, &b->wsabuf, 1, NULL, &b->flags,
-                                 &b->overlapped, NULL);
-                if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
-                    msg_Warn(p_demux, "st2110: WSARecv repost failed (err=%d)", WSAGetLastError());
-            }
+        if (!atomic_load(&p_sys->b_stop_requested)) {
+            bufs[i].wsabuf.buf = (char *)bufs[i].data;
+            bufs[i].wsabuf.len = RECV_BUF_LEN;
+            bufs[i].flags = 0;
+            bufs[i].overlapped.Internal = 0;
+            bufs[i].overlapped.InternalHigh = 0;
+            bufs[i].overlapped.Offset = 0;
+            bufs[i].overlapped.OffsetHigh = 0;
+            int r = WSARecv((SOCKET)p_sys->fd, &bufs[i].wsabuf, 1, NULL, &bufs[i].flags,
+                             &bufs[i].overlapped, NULL);
+            if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
+                msg_Warn(p_demux, "st2110: WSARecv repost failed (err=%d)", WSAGetLastError());
         }
 
         vlc_restorecancel(canc);
     }
 
+    for (unsigned i = 0; i < WIN_BUFS_PER_THREAD; i++)
+        CloseHandle(events[i]);
+    free(bufs);
     return NULL;
 }
 #else
@@ -770,31 +787,9 @@ static int Open(vlc_object_t *obj)
     setsockopt(p_sys->fd, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
 
 #ifdef _WIN32
-    p_sys->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
-    if (!p_sys->iocp) {
-        msg_Err(p_demux, "st2110: CreateIoCompletionPort failed (err=%lu)", GetLastError());
-        goto error;
-    }
-    if (!CreateIoCompletionPort((HANDLE)(uintptr_t)(SOCKET)p_sys->fd, p_sys->iocp, 0, 0)) {
-        msg_Err(p_demux, "st2110: failed to associate socket with IOCP (err=%lu)", GetLastError());
-        goto error;
-    }
-    p_sys->n_iocp_bufs = p_sys->n_threads * IOCP_BUFS_PER_THREAD;
-    p_sys->iocp_bufs = calloc(p_sys->n_iocp_bufs, sizeof(iocp_buf_t));
-    if (!p_sys->iocp_bufs)
-        goto error;
-    for (unsigned i = 0; i < p_sys->n_iocp_bufs; i++) {
-        iocp_buf_t *b = &p_sys->iocp_bufs[i];
-        memset(&b->overlapped, 0, sizeof(b->overlapped));
-        b->wsabuf.buf = (char *)b->data;
-        b->wsabuf.len = RECV_BUF_LEN;
-        b->flags = 0;
-        int r = WSARecv((SOCKET)p_sys->fd, &b->wsabuf, 1, NULL, &b->flags, &b->overlapped, NULL);
-        if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
-            msg_Err(p_demux, "st2110: WSARecv failed to post buffer %u (err=%d)", i, WSAGetLastError());
-            goto error;
-        }
-    }
+    /* No shared IOCP/buffer setup here: each I/O thread creates and owns
+       its own overlapped recv buffers (see IoThread), since the socket
+       itself is overlapped-capable by default without any association. */
 #else
     { int flags = fcntl(p_sys->fd, F_GETFL, 0); fcntl(p_sys->fd, F_SETFL, flags | O_NONBLOCK); }
 #endif
@@ -870,30 +865,22 @@ static void Close(vlc_object_t *obj)
         vlc_join(p_sys->sender_thread, NULL);
     }
 
+#ifdef _WIN32
+    /* Cancels every I/O thread's outstanding WSARecv()s at once (CancelIoEx,
+       unlike the older CancelIo, cancels operations for this handle
+       regardless of which thread issued them), so each thread's
+       WaitForMultipleObjects() wakes immediately instead of waiting out
+       its own 1000ms timeout. Each thread closes its own event handles
+       and frees its own buffers just before returning (see IoThread). */
+    if (p_sys->fd != -1)
+        CancelIoEx((HANDLE)(uintptr_t)(SOCKET)p_sys->fd, NULL);
+#endif
+
     for (unsigned i = 0; i < p_sys->n_threads_started; i++) {
         vlc_cancel(p_sys->threads[i]);
         vlc_join(p_sys->threads[i], NULL);
     }
     free(p_sys->threads);
-
-#ifdef _WIN32
-    if (p_sys->iocp) {
-        /* All I/O threads have already been joined above, so nothing will
-           observe these completions; this purely ensures the OS is done
-           writing into iocp_bufs before free() reclaims that memory. */
-        if (p_sys->fd != -1)
-            CancelIoEx((HANDLE)(uintptr_t)(SOCKET)p_sys->fd, NULL);
-        if (p_sys->iocp_bufs) {
-            OVERLAPPED_ENTRY drain[IOCP_MAX_COMPLETIONS];
-            ULONG n;
-            while (GetQueuedCompletionStatusEx(p_sys->iocp, drain, IOCP_MAX_COMPLETIONS, &n, 0, FALSE) && n > 0)
-                ; /* discard */
-        }
-        CloseHandle(p_sys->iocp);
-        p_sys->iocp = NULL;
-    }
-    free(p_sys->iocp_bufs);
-#endif
 
     if (p_sys->fd != -1)
         net_Close(p_sys->fd);
