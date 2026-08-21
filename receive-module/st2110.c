@@ -4,34 +4,47 @@
  * Receives 10bit YCbCr 4:2:2 GPM video carried per RFC 4175 over RTP/UDP and
  * outputs VLC_CODEC_I422_10L. See docs/vlc-st2110_receive-module_仕様書.md.
  *
- * Architecture (rewritten from the earlier batched-worker-pool design after
- * measurement showed the true wire packet rate for a real 1080i59.94
- * 4:2:2 10bit stream (~486k pkts/sec, confirmed via an independent pktmon
- * capture) vastly exceeds what a single receive thread can drain, even
- * after extensive optimization):
+ * Architecture (revised after measurement + research showed the previous
+ * design's "one CPU core pegged, playback unusable" symptom was NOT a
+ * hardware or OS limit, but our own threading pattern):
  *
- *   - RFC4175 packets are fully self-describing: each one's Sample Row Data
- *     header(s) give the exact (line, field, x-offset, length) its own
- *     payload covers (verified against the RFC4175 text itself -- the
- *     continuation bit only chains multiple headers WITHIN one packet, and
- *     Offset/Length are always relative to that packet's own data). No
- *     packet needs any information from any other packet to know where its
- *     pixels belong, and no "frame" or "field" bookkeeping is needed for
- *     correctness of placement.
- *   - So: N identical I/O threads each receive independently from the same
- *     socket, and each does the FULL pipeline itself (parse -> unpack ->
- *     write) directly into one persistent, never-cleared "master" picture
- *     buffer. Writes never need locking: two different packets' target
- *     byte ranges never overlap (different lines, or non-overlapping
- *     segments of the same line).
- *     On Windows this deliberately does NOT route all threads through one
- *     shared IOCP: IOCP's completion dispatch favors waking the most
- *     recently active thread (for cache locality), which under sustained
- *     load left one thread doing nearly all the work while the others sat
- *     comparatively idle (observed directly via Task Manager's per-core
- *     view). Instead, each thread owns its own pool of overlapped
- *     WSARecv() buffers/events and waits on those alone via
- *     WaitForMultipleObjects(), which has no such affinity bias.
+ *   - The earlier design had N threads *all* calling recv()/WSARecv() on
+ *     the same shared socket. This is a well-documented anti-pattern: a
+ *     UDP socket's receive queue is guarded by a single kernel-level lock,
+ *     so concurrent recv() calls from multiple threads on ONE socket
+ *     serialize on that lock and get WORSE, not better, as thread count
+ *     grows (matches published research, e.g. "Analysis of Linux UDP
+ *     Sockets Concurrent Performance"). This is exactly why the symptom
+ *     reproduced identically on both a weak laptop and a 24-core Xeon +
+ *     Intel X520: the bottleneck was never raw CPU throughput. Real
+ *     ST2110 software confirms this -- GStreamer's rtpvrawdepay (a real,
+ *     deployed RFC4175 depayloader) is single-threaded; NVIDIA Rivermax
+ *     documents a single, CPU-pinned receive thread per stream, not one
+ *     thread per core.
+ *   - New design: exactly ONE dedicated receive thread ever touches the
+ *     socket. It does nothing but recv() and copy the raw datagram into a
+ *     shared, bounded, mutex+condvar-guarded staging queue, then goes
+ *     straight back to recv()ing -- kept as fast/simple as possible so it
+ *     can never fall behind the wire rate. If the queue is ever full
+ *     (workers falling behind), the incoming packet is dropped and
+ *     counted rather than blocking the receive thread.
+ *   - N worker threads pop raw packets off that queue and do the actual
+ *     parse -> unpack -> write work in parallel. This is where the real
+ *     per-packet CPU cost lives, and it parallelizes cleanly since RFC4175
+ *     packets are fully self-describing (verified against the RFC4175
+ *     text itself -- the continuation bit only chains headers WITHIN one
+ *     packet, and Offset/Length are always relative to that packet's own
+ *     data). No packet needs information from any other packet, and no
+ *     "frame"/"field" bookkeeping is needed for correct placement. Writes
+ *     into the master buffer never need locking: two different packets'
+ *     target byte ranges never overlap.
+ *   - Per-worker diagnostic counters (header/failure counts) are one array
+ *     slot per worker, written only by that worker and read/reset by the
+ *     sender thread every ~5s -- this also retires the previous design's
+ *     other latent bug, where every thread incremented the SAME shared
+ *     atomic counters on every packet (cache-line contention that gets
+ *     worse with more threads, for the same underlying reason as the
+ *     socket issue above).
  *   - A single, independent sender thread ticks on its own clock (not
  *     driven by arrival timing at all) and periodically snapshots whatever
  *     is currently in the master buffer to es_out. Packet loss just means
@@ -91,11 +104,15 @@
 
 #define SO_RCVBUF_SIZE (32 * 1024 * 1024)
 
-/* Overlapped WSARecv() buffers each Windows I/O thread keeps in flight on
- * its own (see the file header comment for why each thread owns its own
- * pool instead of sharing one IOCP). Must stay under MAXIMUM_WAIT_OBJECTS
- * (64), since a thread waits on all of its own buffers' events at once via
- * WaitForMultipleObjects(). */
+/* Depth of the staging queue between the one receive thread and the N
+ * worker threads, in packets. At ~1400 bytes/packet this is ~16MB of
+ * buffering -- generous headroom against short worker stalls without the
+ * receive thread ever having to block. */
+#define QUEUE_CAPACITY        4096
+
+/* Overlapped WSARecv() buffers the (single) Windows receive thread keeps
+ * in flight at once, so it never has to wait for one recv() to complete
+ * before starting the next. Must stay under MAXIMUM_WAIT_OBJECTS (64). */
 #define WIN_BUFS_PER_THREAD    16
 
 /*
@@ -126,9 +143,8 @@ typedef struct {
 } rfc4175_line_hdr_t;
 
 #ifdef _WIN32
-/* One overlapped WSARecv() buffer, owned by exactly one I/O thread (never
- * shared across threads). overlapped.hEvent is set once at creation and
- * preserved across reposts. */
+/* One overlapped WSARecv() buffer, owned by the (single) receive thread.
+ * overlapped.hEvent is set once at creation and preserved across reposts. */
 typedef struct {
     OVERLAPPED overlapped;
     WSABUF     wsabuf;
@@ -136,6 +152,32 @@ typedef struct {
     uint8_t    data[RECV_BUF_LEN];
 } win_recv_buf_t;
 #endif
+
+/* One slot in the shared staging queue: a raw, not-yet-parsed copy of one
+ * received datagram. */
+typedef struct {
+    uint8_t data[RECV_BUF_LEN];
+    size_t  len;
+} queue_slot_t;
+
+/* Per-worker diagnostic counters: written only by the one worker thread
+ * that owns this slot (see the file header comment for why this replaces
+ * the old shared-atomic-counter design), read + reset by the sender
+ * thread every ~5s. Since only the owning thread ever increments a given
+ * slot, these atomic ops are always uncontended in steady state -- the
+ * occasional cross-thread read by the sender is rare enough (every ~5s)
+ * for the resulting cache-line transfer to be negligible. */
+typedef struct {
+    atomic_uint pkts_rtp_fail;
+    atomic_uint pkts_line_fail;
+    atomic_uint hdrs_total;
+    atomic_uint hdrs_field2;
+} worker_stats_t;
+
+typedef struct {
+    demux_t *p_demux;
+    unsigned worker_index;
+} worker_arg_t;
 
 struct demux_sys_t
 {
@@ -154,10 +196,11 @@ struct demux_sys_t
     unsigned i_fps_den;
 
     /* line-number convention, detected from the first few packets by
-       whichever I/O thread happens to see them first. Racy but harmless:
-       redundant writes of the same correct value from multiple threads
-       are fine, and DetectLineMode() only needs the SDP-declared cases to
-       be told apart, not exact packet ordering. */
+       whichever worker thread happens to see them first. Racy but
+       harmless: redundant writes of the same correct value from multiple
+       threads are fine, and DetectLineMode() only needs the SDP-declared
+       cases to be told apart, not exact packet ordering. Only touched
+       during the brief startup detection window, never again afterward. */
     atomic_uint line_mode;              /* line_mode_t */
     atomic_uint i_pkts_for_line_detect;  /* cumulative, never reset */
 
@@ -166,7 +209,7 @@ struct demux_sys_t
     date_t       pts;
 
     /* Persistent picture buffer: allocated and zeroed once, then NEVER
-       cleared again. Every I/O thread writes incoming pixels directly
+       cleared again. Every worker thread writes incoming pixels directly
        into it at the position its own packet describes; the sender
        thread periodically copies whatever is currently in it out to
        es_out. No lock is needed for the writes: RFC4175 guarantees two
@@ -182,37 +225,60 @@ struct demux_sys_t
     size_t   i_y_plane_size;
     size_t   i_uv_plane_size;
 
-    /* I/O threads: N identical threads, each running the full
-       receive -> parse -> unpack pipeline itself (see the file header
-       comment for why no hand-off between stages is needed anymore). */
-    unsigned       n_threads;
-    vlc_thread_t  *threads;
-    unsigned       n_threads_started;
+    /* Receive thread: exactly one. It is the ONLY thread that ever
+       touches the socket (see the file header comment for why sharing a
+       socket across multiple recv()ing threads is an anti-pattern, not a
+       parallelism win). Its only job is recv() + copy into p_queue below,
+       as fast as possible -- no parsing happens here. */
+    vlc_thread_t receive_thread;
+    bool         b_receive_started;
+
+    /* Shared staging queue between the one receive thread (single
+       producer) and the N worker threads below (multiple consumers).
+       Bounded: if it's ever full, the receive thread drops the incoming
+       packet (counted in i_pkts_dropped_queue_full) rather than blocking,
+       since a blocked receive thread is worse than one dropped packet. */
+    queue_slot_t *p_queue;
+    unsigned      i_queue_cap;
+    unsigned      i_queue_head;
+    unsigned      i_queue_tail;
+    unsigned      i_queue_count;
+    vlc_mutex_t   queue_lock;
+    vlc_cond_t    queue_not_empty;
+    bool          b_queue_lock_inited;
+    bool          b_queue_cond_inited;
+    atomic_uint   i_pkts_dropped_queue_full;
+
+    /* Worker threads: N of these pop raw packets off p_queue and run the
+       full parse -> unpack -> write pipeline in parallel. */
+    unsigned        n_threads;
+    vlc_thread_t   *worker_threads;
+    worker_arg_t   *p_worker_args;
+    worker_stats_t *p_worker_stats;
+    unsigned        n_workers_started;
 
     /* sender thread: independent clock, decoupled from arrival timing */
     vlc_thread_t sender_thread;
     bool         b_sender_started;
 
     /* Cooperative shutdown signal: a blocked WaitForMultipleObjects()/
-       poll() is not guaranteed to be interrupted by vlc_cancel() on every
-       platform, so every wait loop here also checks this flag on its own
-       bounded timeout, guaranteeing Close()'s vlc_join() calls can never
-       hang. */
+       poll()/vlc_cond_timedwait() is not guaranteed to be interrupted by
+       vlc_cancel() on every platform, so every wait loop here also checks
+       this flag on its own bounded timeout, guaranteeing Close()'s
+       vlc_join() calls can never hang. */
     atomic_bool  b_stop_requested;
 
-    /* rolling diagnostics: written by any I/O thread (atomic), read and
-       reset by the sender thread every ~5s */
+    /* rolling diagnostic: total packets actually received off the wire.
+       Written only by the single receive thread, so this atomic is never
+       contended; read and reset by the sender thread every ~5s. */
     atomic_uint i_pkts_total;
-    atomic_uint i_pkts_rtp_fail;
-    atomic_uint i_pkts_line_fail;
-    atomic_uint i_hdrs_total;
-    atomic_uint i_hdrs_field2;
 };
 
 static int  Open(vlc_object_t *);
 static void Close(vlc_object_t *);
 static int  Control(demux_t *, int, va_list);
-static void *IoThread(void *);
+static void *ReceiveThread(void *);
+static void *WorkerThread(void *);
 static void *SenderThread(void *);
 
 vlc_module_begin()
@@ -232,7 +298,7 @@ vlc_module_begin()
     add_string("st2110-fps", "30000/1001", "Frame rate (num/den)", NULL, true)
     add_string("st2110-colorimetry", "BT709", "Colorimetry (BT709/BT2020/ST2084/HLG)", NULL, true)
     add_bool("st2110-interlace", false, "Interlaced", NULL, true)
-    add_integer("st2110-threads", 0, "Receive threads (0 = auto-detect from CPU count)", NULL, true)
+    add_integer("st2110-threads", 0, "Processing threads (0 = auto-detect from CPU count)", NULL, true)
 vlc_module_end()
 
 /* ---- helpers ---- */
@@ -396,13 +462,14 @@ static bool MapLine(const demux_sys_t *p_sys, const rfc4175_line_hdr_t *h,
 }
 
 /* Unpacks RFC4175 YCbCr-4:2:2 10bit GPM pgroups (5 bytes -> Cb,Y0,Cr,Y1)
- * directly into the persistent master buffer's Y/U/V planes. Called
- * directly by whichever I/O thread received this packet -- no queueing,
- * no hand-off, no lock: this packet's target byte ranges never overlap
- * another packet's (different line, or a non-overlapping segment of the
- * same line), so concurrent calls from different threads are safe. */
-static void WriteLines(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
-                        unsigned n_hdrs, const uint8_t *data, size_t data_len)
+ * directly into the persistent master buffer's Y/U/V planes. Called by
+ * whichever worker thread dequeued this packet -- no lock: this packet's
+ * target byte ranges never overlap another packet's (different line, or a
+ * non-overlapping segment of the same line), so concurrent calls from
+ * different worker threads are safe. */
+static void WriteLines(demux_sys_t *p_sys, worker_stats_t *stats,
+                        const rfc4175_line_hdr_t *hdrs, unsigned n_hdrs,
+                        const uint8_t *data, size_t data_len)
 {
     size_t off = 0;
     unsigned half_w = p_sys->i_width / 2;
@@ -416,9 +483,9 @@ static void WriteLines(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
     for (unsigned i = 0; i < n_hdrs; i++) {
         const rfc4175_line_hdr_t *h = &hdrs[i];
 
-        atomic_fetch_add(&p_sys->i_hdrs_total, 1);
+        atomic_fetch_add(&stats->hdrs_total, 1);
         if (h->field2)
-            atomic_fetch_add(&p_sys->i_hdrs_field2, 1);
+            atomic_fetch_add(&stats->hdrs_field2, 1);
 
         if (off + h->length > data_len)
             break; /* the rest of the chain can't be trusted either */
@@ -468,20 +535,23 @@ static void WriteLines(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
 }
 
 /* Parses one packet and writes its pixels straight into the master buffer.
- * Shared by every platform's I/O thread below. No frame/field bookkeeping
- * of any kind: each packet is fully self-describing (see file header). */
-static void ProcessPacket(demux_sys_t *p_sys, const uint8_t *pkt, size_t len)
+ * Called by a worker thread with its own per-worker stats slot (see the
+ * file header comment for why these are per-worker, not shared). No
+ * frame/field bookkeeping of any kind: each packet is fully self-describing
+ * (see file header). */
+static void ProcessPacket(demux_sys_t *p_sys, worker_stats_t *stats,
+                           const uint8_t *pkt, size_t len)
 {
     unsigned hdr_len;
     if (ParseRTP(pkt, len, &hdr_len) != 0) {
-        atomic_fetch_add(&p_sys->i_pkts_rtp_fail, 1);
+        atomic_fetch_add(&stats->pkts_rtp_fail, 1);
         return;
     }
 
     const uint8_t *payload = pkt + hdr_len;
     size_t payload_len = len - hdr_len;
     if (payload_len < RFC4175_EXT_SEQ_LEN) {
-        atomic_fetch_add(&p_sys->i_pkts_line_fail, 1);
+        atomic_fetch_add(&stats->pkts_line_fail, 1);
         return;
     }
     payload += RFC4175_EXT_SEQ_LEN;
@@ -492,26 +562,80 @@ static void ProcessPacket(demux_sys_t *p_sys, const uint8_t *pkt, size_t len)
     size_t hdr_bytes;
     if (ParseLineHeaders(payload, payload_len, hdrs, MAX_LINE_SEGMENTS,
                           &n_hdrs, &hdr_bytes) != 0) {
-        atomic_fetch_add(&p_sys->i_pkts_line_fail, 1);
+        atomic_fetch_add(&stats->pkts_line_fail, 1);
         return;
     }
 
     DetectLineMode(p_sys, hdrs, n_hdrs);
-    WriteLines(p_sys, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
+    WriteLines(p_sys, stats, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
+}
+
+/* Pushes a raw, not-yet-parsed datagram into the shared staging queue.
+ * Called only by the one receive thread (single producer); the queue's
+ * head/tail/count state is still shared with the N consumer worker
+ * threads, so it's protected by a plain mutex -- cheap relative to the
+ * per-packet parse/unpack work done outside the lock on the consumer
+ * side. If the queue is full, the packet is dropped rather than blocking
+ * the receive thread, which must never fall behind recv()ing. */
+static void QueuePush(demux_sys_t *p_sys, const uint8_t *data, size_t len)
+{
+    vlc_mutex_lock(&p_sys->queue_lock);
+    if (p_sys->i_queue_count == p_sys->i_queue_cap) {
+        vlc_mutex_unlock(&p_sys->queue_lock);
+        atomic_fetch_add(&p_sys->i_pkts_dropped_queue_full, 1);
+        return;
+    }
+
+    queue_slot_t *slot = &p_sys->p_queue[p_sys->i_queue_tail];
+    memcpy(slot->data, data, len);
+    slot->len = len;
+    p_sys->i_queue_tail = (p_sys->i_queue_tail + 1) % p_sys->i_queue_cap;
+    p_sys->i_queue_count++;
+    vlc_mutex_unlock(&p_sys->queue_lock);
+
+    vlc_cond_signal(&p_sys->queue_not_empty);
+}
+
+/* Pops one raw datagram for a worker thread to process. Returns false only
+ * once shutdown has been requested AND the queue has fully drained -- any
+ * packets still queued at shutdown are processed first, so nothing queued
+ * is silently discarded. The wait is bounded (500ms) purely so the stop
+ * flag gets rechecked even if a signal is ever missed; it is not the
+ * primary wakeup path (vlc_cond_signal from QueuePush is). */
+static bool QueuePop(demux_sys_t *p_sys, uint8_t *out_data, size_t *out_len)
+{
+    vlc_mutex_lock(&p_sys->queue_lock);
+    while (p_sys->i_queue_count == 0) {
+        if (atomic_load(&p_sys->b_stop_requested)) {
+            vlc_mutex_unlock(&p_sys->queue_lock);
+            return false;
+        }
+        vlc_cond_timedwait(&p_sys->queue_not_empty, &p_sys->queue_lock,
+                            mdate() + 500000 /* 500ms */);
+    }
+
+    queue_slot_t *slot = &p_sys->p_queue[p_sys->i_queue_head];
+    memcpy(out_data, slot->data, slot->len);
+    *out_len = slot->len;
+    p_sys->i_queue_head = (p_sys->i_queue_head + 1) % p_sys->i_queue_cap;
+    p_sys->i_queue_count--;
+    vlc_mutex_unlock(&p_sys->queue_lock);
+    return true;
 }
 
 #ifdef _WIN32
-/* Windows I/O thread: N of these each own an independent pool of
- * WIN_BUFS_PER_THREAD overlapped WSARecv() buffers/events and wait only on
- * their own (see the file header comment for why this avoids IOCP's
- * cache-locality-biased dispatch). Each does the full parse+unpack itself
- * and reposts its own buffer immediately.
+/* Windows receive thread: exactly one of these ever exists (see the file
+ * header comment for why multiple threads sharing one socket is an
+ * anti-pattern rather than a parallelism win). It keeps WIN_BUFS_PER_THREAD
+ * overlapped WSARecv() buffers/events in flight so it never waits for one
+ * recv() to complete before starting the next, and its only job on
+ * completion is to copy the datagram into the staging queue and repost --
+ * no parsing happens on this thread.
  *
  * The wait is bounded (1000ms) and, on cancellation, Close() also calls
- * CancelIoEx() once (which cancels every thread's outstanding recv()s
- * regardless of which thread issued them), so a waiting thread wakes
- * promptly on shutdown rather than waiting out the full timeout. */
-static void *IoThread(void *data)
+ * CancelIoEx() once, so this thread wakes promptly on shutdown rather than
+ * waiting out the full timeout. */
+static void *ReceiveThread(void *data)
 {
     demux_t *p_demux = data;
     demux_sys_t *p_sys = p_demux->p_sys;
@@ -519,7 +643,7 @@ static void *IoThread(void *data)
     win_recv_buf_t *bufs = calloc(WIN_BUFS_PER_THREAD, sizeof(win_recv_buf_t));
     HANDLE events[WIN_BUFS_PER_THREAD];
     if (!bufs) {
-        msg_Err(p_demux, "st2110: I/O thread failed to allocate buffers");
+        msg_Err(p_demux, "st2110: receive thread failed to allocate buffers");
         return NULL;
     }
 
@@ -551,7 +675,7 @@ static void *IoThread(void *data)
         BOOL ok = WSAGetOverlappedResult((SOCKET)p_sys->fd, &bufs[i].overlapped, &xfer, FALSE, &flags);
         if (ok && xfer > 0) {
             atomic_fetch_add(&p_sys->i_pkts_total, 1);
-            ProcessPacket(p_sys, bufs[i].data, (size_t)xfer);
+            QueuePush(p_sys, bufs[i].data, (size_t)xfer);
         }
 
         if (!atomic_load(&p_sys->b_stop_requested)) {
@@ -577,13 +701,13 @@ static void *IoThread(void *data)
     return NULL;
 }
 #else
-/* POSIX I/O thread: N of these all poll()+recv() the SAME shared socket.
- * poll() here resolves to vlc_poll() (see vlc_threads.h), VLC's
- * cancellation-aware wrapper -- raw select() has no such wrapper and
- * would make Close()'s vlc_join() hang forever. Multiple threads blocking
- * in poll()/recv() on one UDP socket is a standard, safe pattern: the
- * kernel hands each arriving datagram to exactly one waiter. */
-static void *IoThread(void *data)
+/* POSIX receive thread: exactly one of these ever exists (see the file
+ * header comment). poll() here resolves to vlc_poll() (see vlc_threads.h),
+ * VLC's cancellation-aware wrapper -- raw select() has no such wrapper and
+ * would make Close()'s vlc_join() hang forever. Its only job is to drain
+ * the socket and copy each datagram into the staging queue -- no parsing
+ * happens on this thread. */
+static void *ReceiveThread(void *data)
 {
     demux_t *p_demux = data;
     demux_sys_t *p_sys = p_demux->p_sys;
@@ -616,7 +740,7 @@ static void *IoThread(void *data)
                 break;
             }
             atomic_fetch_add(&p_sys->i_pkts_total, 1);
-            ProcessPacket(p_sys, pkt, (size_t)len);
+            QueuePush(p_sys, pkt, (size_t)len);
         }
 
         vlc_restorecancel(canc);
@@ -625,6 +749,31 @@ static void *IoThread(void *data)
     return NULL;
 }
 #endif
+
+/* Worker thread: N of these pop raw packets off the staging queue and run
+ * the full parse -> unpack -> write pipeline in parallel, entirely
+ * decoupled from the socket (see the file header comment). Platform-
+ * independent, since it never touches the network itself. */
+static void *WorkerThread(void *data)
+{
+    worker_arg_t *arg = data;
+    demux_t     *p_demux = arg->p_demux;
+    demux_sys_t *p_sys   = p_demux->p_sys;
+    worker_stats_t *stats = &p_sys->p_worker_stats[arg->worker_index];
+    uint8_t pkt[RECV_BUF_LEN];
+
+    for (;;) {
+        size_t len;
+        if (!QueuePop(p_sys, pkt, &len))
+            break;
+
+        int canc = vlc_savecancel();
+        ProcessPacket(p_sys, stats, pkt, len);
+        vlc_restorecancel(canc);
+    }
+
+    return NULL;
+}
 
 /* Independent sender thread: ticks on its own clock at the stream's
  * declared frame rate, completely decoupled from arrival timing. Each
@@ -666,14 +815,20 @@ static void *SenderThread(void *data)
         date_Increment(&p_sys->pts, 1);
 
         if (mdate() - stat_window_start > 5 * CLOCK_FREQ) {
-            unsigned pkts      = atomic_exchange(&p_sys->i_pkts_total, 0);
-            unsigned rtp_fail  = atomic_exchange(&p_sys->i_pkts_rtp_fail, 0);
-            unsigned line_fail = atomic_exchange(&p_sys->i_pkts_line_fail, 0);
-            unsigned hdrs      = atomic_exchange(&p_sys->i_hdrs_total, 0);
-            unsigned hdrs_f2   = atomic_exchange(&p_sys->i_hdrs_field2, 0);
+            unsigned pkts    = atomic_exchange(&p_sys->i_pkts_total, 0);
+            unsigned dropped = atomic_exchange(&p_sys->i_pkts_dropped_queue_full, 0);
 
-            msg_Warn(p_demux, "st2110: pkts=%u rtp_fail=%u line_fail=%u",
-                     pkts, rtp_fail, line_fail);
+            unsigned rtp_fail = 0, line_fail = 0, hdrs = 0, hdrs_f2 = 0;
+            for (unsigned i = 0; i < p_sys->n_threads; i++) {
+                worker_stats_t *ws = &p_sys->p_worker_stats[i];
+                rtp_fail  += atomic_exchange(&ws->pkts_rtp_fail, 0);
+                line_fail += atomic_exchange(&ws->pkts_line_fail, 0);
+                hdrs      += atomic_exchange(&ws->hdrs_total, 0);
+                hdrs_f2   += atomic_exchange(&ws->hdrs_field2, 0);
+            }
+
+            msg_Warn(p_demux, "st2110: pkts=%u dropped=%u rtp_fail=%u line_fail=%u",
+                     pkts, dropped, rtp_fail, line_fail);
             if (p_sys->b_interlace)
                 msg_Warn(p_demux, "st2110: line headers total=%u field2=%u (%.1f%%)",
                          hdrs, hdrs_f2, hdrs ? 100.0 * hdrs_f2 / hdrs : 0.0);
@@ -766,19 +921,14 @@ static int Open(vlc_object_t *obj)
                  psz_sampling);
     free(psz_sampling);
 
-    /* How many I/O threads: an explicit st2110-threads option always wins;
-       otherwise auto-detect from the CPU count, reserving TWO cores (not
-       just one) -- one for VLC's own decode/convert/render pipeline, and
-       one extra as slack for whatever core the NIC driver's RSS/DPC
-       processing is pinned to (Windows RSS deliberately keeps all receive
-       processing for a single flow, like our one multicast stream, on
-       one fixed core -- see the file header comment -- and a Windows
-       driver on at least one tested adapter didn't report which core via
-       the usual query, so this can't be targeted precisely; leaving extra
-       headroom instead gives the OS scheduler more room to avoid
-       whichever core that turns out to be). These threads run at
-       elevated priority below, since (unlike the old design) they now do
-       the full, latency-critical receive+unpack pipeline themselves. */
+    /* How many worker (processing) threads: an explicit st2110-threads
+       option always wins; otherwise auto-detect from the CPU count,
+       reserving TWO cores -- one for the single dedicated receive thread
+       above, one for VLC's own decode/convert/render pipeline. These
+       threads never touch the socket (see the file header comment for
+       why that's now a dedicated single thread instead), so there's no
+       RSS/kernel-affinity concern to work around here: this count is
+       purely about how much parse/unpack CPU work can run in parallel. */
     int i_threads_opt = var_InheritInteger(p_demux, "st2110-threads");
     if (i_threads_opt > 0) {
         p_sys->n_threads = (unsigned)i_threads_opt;
@@ -797,9 +947,10 @@ static int Open(vlc_object_t *obj)
     setsockopt(p_sys->fd, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
 
 #ifdef _WIN32
-    /* No shared IOCP/buffer setup here: each I/O thread creates and owns
-       its own overlapped recv buffers (see IoThread), since the socket
-       itself is overlapped-capable by default without any association. */
+    /* No shared IOCP/buffer setup here: the (single) receive thread
+       creates and owns its own overlapped recv buffers (see
+       ReceiveThread), since the socket itself is overlapped-capable by
+       default without any association. */
 #else
     { int flags = fcntl(p_sys->fd, F_GETFL, 0); fcntl(p_sys->fd, F_SETFL, flags | O_NONBLOCK); }
 #endif
@@ -833,19 +984,42 @@ static int Open(vlc_object_t *obj)
     p_demux->pf_demux = NULL;      /* live source: pushed asynchronously by the sender thread */
     p_demux->pf_control = Control;
 
-    msg_Info(p_demux, "st2110: %s:%d %ux%u interlace=%d fps=%u/%u threads=%u",
+    msg_Info(p_demux, "st2110: %s:%d %ux%u interlace=%d fps=%u/%u workers=%u",
              p_sys->psz_group, p_sys->i_port, p_sys->i_width, p_sys->i_height,
              p_sys->b_interlace, p_sys->i_fps_num, p_sys->i_fps_den, p_sys->n_threads);
 
-    p_sys->threads = calloc(p_sys->n_threads, sizeof(vlc_thread_t));
-    if (!p_sys->threads)
+    /* Staging queue, shared between the one receive thread and the N
+       worker threads spawned below. */
+    p_sys->i_queue_cap = QUEUE_CAPACITY;
+    p_sys->p_queue = calloc(p_sys->i_queue_cap, sizeof(queue_slot_t));
+    if (!p_sys->p_queue)
         goto error;
+    vlc_mutex_init(&p_sys->queue_lock);
+    p_sys->b_queue_lock_inited = true;
+    vlc_cond_init(&p_sys->queue_not_empty);
+    p_sys->b_queue_cond_inited = true;
+
+    p_sys->p_worker_stats = calloc(p_sys->n_threads, sizeof(worker_stats_t));
+    p_sys->p_worker_args  = calloc(p_sys->n_threads, sizeof(worker_arg_t));
+    p_sys->worker_threads = calloc(p_sys->n_threads, sizeof(vlc_thread_t));
+    if (!p_sys->p_worker_stats || !p_sys->p_worker_args || !p_sys->worker_threads)
+        goto error;
+
+    if (vlc_clone(&p_sys->receive_thread, ReceiveThread, p_demux, VLC_THREAD_PRIORITY_INPUT)) {
+        msg_Err(p_demux, "st2110: failed to spawn receive thread");
+        goto error;
+    }
+    p_sys->b_receive_started = true;
+
     for (unsigned i = 0; i < p_sys->n_threads; i++) {
-        if (vlc_clone(&p_sys->threads[i], IoThread, p_demux, VLC_THREAD_PRIORITY_INPUT)) {
-            msg_Err(p_demux, "st2110: failed to spawn I/O thread %u", i);
+        p_sys->p_worker_args[i].p_demux = p_demux;
+        p_sys->p_worker_args[i].worker_index = i;
+        if (vlc_clone(&p_sys->worker_threads[i], WorkerThread, &p_sys->p_worker_args[i],
+                      VLC_THREAD_PRIORITY_INPUT)) {
+            msg_Err(p_demux, "st2110: failed to spawn worker thread %u", i);
             goto error;
         }
-        p_sys->n_threads_started++;
+        p_sys->n_workers_started++;
     }
 
     if (vlc_clone(&p_sys->sender_thread, SenderThread, p_demux, VLC_THREAD_PRIORITY_OUTPUT)) {
@@ -876,21 +1050,35 @@ static void Close(vlc_object_t *obj)
     }
 
 #ifdef _WIN32
-    /* Cancels every I/O thread's outstanding WSARecv()s at once (CancelIoEx,
+    /* Cancels the receive thread's outstanding WSARecv()s (CancelIoEx,
        unlike the older CancelIo, cancels operations for this handle
-       regardless of which thread issued them), so each thread's
-       WaitForMultipleObjects() wakes immediately instead of waiting out
-       its own 1000ms timeout. Each thread closes its own event handles
-       and frees its own buffers just before returning (see IoThread). */
+       regardless of which thread issued them), so it wakes immediately
+       instead of waiting out its own 1000ms timeout. */
     if (p_sys->fd != -1)
         CancelIoEx((HANDLE)(uintptr_t)(SOCKET)p_sys->fd, NULL);
 #endif
 
-    for (unsigned i = 0; i < p_sys->n_threads_started; i++) {
-        vlc_cancel(p_sys->threads[i]);
-        vlc_join(p_sys->threads[i], NULL);
+    if (p_sys->b_receive_started) {
+        vlc_cancel(p_sys->receive_thread);
+        vlc_join(p_sys->receive_thread, NULL);
     }
-    free(p_sys->threads);
+
+    /* Worker threads drain whatever is still queued, then notice
+       b_stop_requested inside QueuePop (bounded to at most a 500ms wait
+       if a wakeup signal is ever missed) and exit. */
+    for (unsigned i = 0; i < p_sys->n_workers_started; i++) {
+        vlc_cancel(p_sys->worker_threads[i]);
+        vlc_join(p_sys->worker_threads[i], NULL);
+    }
+    free(p_sys->worker_threads);
+    free(p_sys->p_worker_args);
+    free(p_sys->p_worker_stats);
+
+    if (p_sys->b_queue_cond_inited)
+        vlc_cond_destroy(&p_sys->queue_not_empty);
+    if (p_sys->b_queue_lock_inited)
+        vlc_mutex_destroy(&p_sys->queue_lock);
+    free(p_sys->p_queue);
 
     if (p_sys->fd != -1)
         net_Close(p_sys->fd);
