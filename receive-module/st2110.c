@@ -283,6 +283,13 @@ struct demux_sys_t
        even rows only). */
     atomic_uint i_hdrs_total;
     atomic_uint i_hdrs_field2;
+    /* How many valid, in-range line headers landed on an output row that
+       this same accumulation cycle had ALREADY marked filled. High vs.
+       i_hdrs_total means many different wire line numbers are computing
+       the same MapLine() output row instead of spreading across the full
+       0-539 range -- i.e. a mapping bug, not packet loss (loss would show
+       up as low i_hdrs_total or nonzero drop counters, not this). */
+    atomic_uint i_hdrs_dup_line;
 };
 
 static int  Open(vlc_object_t *);
@@ -575,6 +582,8 @@ static void WriteLines(demux_sys_t *p_sys, const rfc4175_line_hdr_t *hdrs,
            packet, not by line), so "check then set" would race. */
         if (!atomic_exchange(&p_sys->p_line_filled[out_line], true))
             p_sys->i_lines_filled++;
+        else
+            p_sys->i_hdrs_dup_line++;
 
         off += h->length;
     }
@@ -864,12 +873,14 @@ static void CheckStatsWindow(demux_t *p_demux, demux_sys_t *p_sys)
                  p_sys->i_pkts_total, p_sys->i_pkts_rtp_fail,
                  p_sys->i_pkts_line_fail, p_sys->i_pkts_no_frame);
     if (p_sys->b_interlace)
-        msg_Warn(p_demux, "st2110: line headers total=%u field2=%u (%.1f%%)",
+        msg_Warn(p_demux, "st2110: line headers total=%u field2=%u (%.1f%%) dup_line=%u (%.1f%%)",
                  p_sys->i_hdrs_total, p_sys->i_hdrs_field2,
-                 p_sys->i_hdrs_total ? 100.0 * p_sys->i_hdrs_field2 / p_sys->i_hdrs_total : 0.0);
+                 p_sys->i_hdrs_total ? 100.0 * p_sys->i_hdrs_field2 / p_sys->i_hdrs_total : 0.0,
+                 p_sys->i_hdrs_dup_line,
+                 p_sys->i_hdrs_total ? 100.0 * p_sys->i_hdrs_dup_line / p_sys->i_hdrs_total : 0.0);
     p_sys->i_pkts_total = p_sys->i_pkts_rtp_fail = 0;
     p_sys->i_pkts_line_fail = p_sys->i_pkts_no_frame = 0;
-    p_sys->i_hdrs_total = p_sys->i_hdrs_field2 = 0;
+    p_sys->i_hdrs_total = p_sys->i_hdrs_field2 = p_sys->i_hdrs_dup_line = 0;
     p_sys->i_idle_polls = 0;
     p_sys->i_stat_window_start = mdate();
 }
