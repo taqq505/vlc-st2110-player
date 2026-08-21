@@ -34,12 +34,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install VLC 3.0.16 (for libvlccore.dll)
-        run: choco install vlc --version=3.0.16 -y
-
-      - name: Fetch matching VLC 3.0.16 headers
+      - name: Install VLC 3.0.20 (for libvlccore.dll)
+        shell: pwsh
         run: |
-          git clone --depth 1 --branch 3.0.16 --filter=blob:none --sparse https://github.com/videolan/vlc vlc-src
+          $attempts = 0
+          do {
+            $attempts++
+            choco install vlc --version=3.0.20 -y
+            if ($LASTEXITCODE -eq 0) { break }
+            Write-Host "choco install failed (attempt $attempts), retrying in 30s..."
+            Start-Sleep -Seconds 30
+          } while ($attempts -lt 5)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Fetch matching VLC 3.0.20 headers
+        run: |
+          git clone --depth 1 --branch 3.0.20 --filter=blob:none --sparse https://github.com/videolan/vlc vlc-src
           cd vlc-src
           git sparse-checkout set include
         shell: bash
