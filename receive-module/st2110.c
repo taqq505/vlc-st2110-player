@@ -1672,11 +1672,23 @@ static int Open(vlc_object_t *obj)
     }
     p_sys->b_receive_started = true;
 
+    /* Deliberately NOT VLC_THREAD_PRIORITY_INPUT here, unlike the single
+       receive thread above. Only the receive thread has a hard
+       real-time requirement (miss the socket even briefly and packets
+       are gone for good); these workers pull from a 4096-deep buffered
+       queue, so they have real slack to be scheduled fairly instead of
+       preemptively. On a high core-count machine, n_threads can be into
+       the twenties -- that many threads simultaneously demanding
+       elevated scheduling priority was found to starve OTHER processes
+       on the same box (observed as the RDP session itself freezing
+       under load), not just this module's own budget. Low priority
+       here fixes that without weakening the one thread that actually
+       needs to stay ahead of the wire. */
     for (unsigned i = 0; i < p_sys->n_threads; i++) {
         p_sys->p_worker_args[i].p_demux = p_demux;
         p_sys->p_worker_args[i].worker_index = i;
         if (vlc_clone(&p_sys->worker_threads[i], WorkerThread, &p_sys->p_worker_args[i],
-                      VLC_THREAD_PRIORITY_INPUT)) {
+                      VLC_THREAD_PRIORITY_LOW)) {
             msg_Err(p_demux, "st2110: failed to spawn worker thread %u", i);
             goto error;
         }
