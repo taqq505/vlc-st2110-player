@@ -276,6 +276,13 @@ typedef struct {
     atomic_uint pkts_line_fail;
     atomic_uint hdrs_total;
     atomic_uint hdrs_field2;
+    /* Headers that parsed fine but were then silently skipped inside
+       WriteLines() -- previously uncounted, so there was no way to tell
+       whether stale-looking picture regions were from real packet loss
+       (which pkts/line_fail above already show is ~0) or from our own
+       validity checks rejecting geometry that should have been good. */
+    atomic_uint hdrs_bad_geometry;  /* length/offset/width sanity checks */
+    atomic_uint hdrs_out_of_range;  /* MapLine() rejected or out_line >= height */
 } worker_stats_t;
 
 typedef struct {
@@ -671,12 +678,14 @@ static void WriteLines(demux_sys_t *p_sys, worker_stats_t *stats, unsigned buf_i
             continue;
         }
         if (h->length % 5 != 0 || h->offset % 2 != 0 || h->offset >= p_sys->i_width) {
+            atomic_fetch_add(&stats->hdrs_bad_geometry, 1);
             off += h->length;
             continue;
         }
 
         unsigned out_line;
         if (!MapLine(p_sys, h, &out_line) || out_line >= p_sys->i_height) {
+            atomic_fetch_add(&stats->hdrs_out_of_range, 1);
             off += h->length;
             continue;
         }
@@ -1281,12 +1290,15 @@ static void *SenderThread(void *data)
             unsigned signals = atomic_exchange(&p_sys->i_frame_signals, 0);
 
             unsigned rtp_fail = 0, line_fail = 0, hdrs = 0, hdrs_f2 = 0;
+            unsigned bad_geo = 0, out_of_range = 0;
             for (unsigned i = 0; i < p_sys->n_threads; i++) {
                 worker_stats_t *ws = &p_sys->p_worker_stats[i];
-                rtp_fail  += atomic_exchange(&ws->pkts_rtp_fail, 0);
-                line_fail += atomic_exchange(&ws->pkts_line_fail, 0);
-                hdrs      += atomic_exchange(&ws->hdrs_total, 0);
-                hdrs_f2   += atomic_exchange(&ws->hdrs_field2, 0);
+                rtp_fail     += atomic_exchange(&ws->pkts_rtp_fail, 0);
+                line_fail    += atomic_exchange(&ws->pkts_line_fail, 0);
+                hdrs         += atomic_exchange(&ws->hdrs_total, 0);
+                hdrs_f2      += atomic_exchange(&ws->hdrs_field2, 0);
+                bad_geo      += atomic_exchange(&ws->hdrs_bad_geometry, 0);
+                out_of_range += atomic_exchange(&ws->hdrs_out_of_range, 0);
             }
 
             msg_Warn(p_demux, "st2110: pkts=%u dropped=%u rtp_fail=%u line_fail=%u",
@@ -1294,6 +1306,16 @@ static void *SenderThread(void *data)
             if (p_sys->b_interlace)
                 msg_Warn(p_demux, "st2110: line headers total=%u field2=%u (%.1f%%)",
                          hdrs, hdrs_f2, hdrs ? 100.0 * hdrs_f2 / hdrs : 0.0);
+            /* Headers that parsed correctly but were then rejected before
+               ever reaching the master buffer -- i.e. valid data that our
+               OWN checks discarded, not data lost on the wire. Any
+               nonzero count here is a direct, exact measure of pixels
+               that stayed stale (carried over from a previous write)
+               instead of being refreshed this cycle. */
+            if (bad_geo || out_of_range)
+                msg_Warn(p_demux, "st2110: headers rejected: bad_geometry=%u "
+                         "out_of_range=%u (this many stayed stale instead of "
+                         "being refreshed)", bad_geo, out_of_range);
             /* Sanity check for the RTP-marker-bit assumption SenderThread
                now relies on: over 5s, this should land close to
                5*(fps_num/fps_den) -- e.g. ~150 for 29.97fps. Near 0 means
