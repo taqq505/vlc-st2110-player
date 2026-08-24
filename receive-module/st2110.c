@@ -448,6 +448,16 @@ struct demux_sys_t
        Written only by the single receive thread, so this atomic is never
        contended; read and reset by the sender thread every ~5s. */
     atomic_uint i_pkts_total;
+
+    /* Wire-level loss, detected from gaps in the RTP sequence number
+       (see TrackSequenceLoss()) -- the same check done manually with an
+       external capture earlier in this project's life, now built in and
+       always on. i_last_rtp_seq is touched only by the single receive
+       thread (no synchronization needed); -1 means "haven't seen a
+       first packet yet". i_pkts_seq_lost is read/reset by the sender
+       thread every ~5s like the other counters. */
+    int          i_last_rtp_seq;
+    atomic_uint  i_pkts_seq_lost;
 };
 
 static int  Open(vlc_object_t *);
@@ -787,6 +797,34 @@ static void ProcessPacket(demux_sys_t *p_sys, worker_stats_t *stats,
         atomic_store(&p_sys->marker_pending, true);
 }
 
+/* Cheap peek at the RTP sequence number (header bytes 2-3) to detect
+ * genuine wire-level loss -- gaps in the sequence -- independent of and
+ * before any full header/line parsing. Called for every datagram the
+ * receive thread gets, regardless of whether it later parses cleanly, so
+ * this measures what actually arrived on the wire, not just what our own
+ * parser accepted. Only ever called from the single receive thread (see
+ * the file header comment for why that's exactly one thread), so
+ * i_last_rtp_seq needs no locking or atomics despite being read-then-
+ * written here every packet. */
+static void TrackSequenceLoss(demux_sys_t *p_sys, const uint8_t *data, size_t len)
+{
+    if (len < 4)
+        return;
+
+    uint16_t seq = ((uint16_t)data[2] << 8) | data[3];
+    if (p_sys->i_last_rtp_seq >= 0) {
+        uint16_t expected = (uint16_t)(p_sys->i_last_rtp_seq + 1);
+        int16_t delta = (int16_t)(seq - expected);
+        /* A positive delta means `delta` sequence numbers were skipped --
+           real loss. A negative delta means this packet arrived out of
+           order or is a duplicate, which isn't loss (whatever it's a
+           duplicate/reorder of already got counted, or will). */
+        if (delta > 0)
+            atomic_fetch_add(&p_sys->i_pkts_seq_lost, (unsigned)delta);
+    }
+    p_sys->i_last_rtp_seq = seq;
+}
+
 /* Pushes a raw, not-yet-parsed datagram into the shared staging queue.
  * Called only by the one receive thread (single producer); the queue's
  * head/tail/count state is still shared with the N consumer worker
@@ -1091,6 +1129,8 @@ static void *ReceiveThread(void *data)
 
                 if (results[i].BytesTransferred > 0) {
                     atomic_fetch_add(&p_sys->i_pkts_total, 1);
+                    TrackSequenceLoss(p_sys, p_sys->p_rio_buf + (size_t)slot * RECV_BUF_LEN,
+                                       results[i].BytesTransferred);
                     QueuePush(p_sys, p_sys->p_rio_buf + (size_t)slot * RECV_BUF_LEN,
                               results[i].BytesTransferred);
                 }
@@ -1164,6 +1204,7 @@ static void *ReceiveThread(void *data)
                 break;
             }
             atomic_fetch_add(&p_sys->i_pkts_total, 1);
+            TrackSequenceLoss(p_sys, pkt, (size_t)len);
             QueuePush(p_sys, pkt, (size_t)len);
         }
 
@@ -1285,9 +1326,10 @@ static void *SenderThread(void *data)
         date_Increment(&p_sys->pts, 1);
 
         if (mdate() - stat_window_start > 5 * CLOCK_FREQ) {
-            unsigned pkts    = atomic_exchange(&p_sys->i_pkts_total, 0);
-            unsigned dropped = atomic_exchange(&p_sys->i_pkts_dropped_queue_full, 0);
-            unsigned signals = atomic_exchange(&p_sys->i_frame_signals, 0);
+            unsigned pkts     = atomic_exchange(&p_sys->i_pkts_total, 0);
+            unsigned dropped  = atomic_exchange(&p_sys->i_pkts_dropped_queue_full, 0);
+            unsigned signals  = atomic_exchange(&p_sys->i_frame_signals, 0);
+            unsigned seq_lost = atomic_exchange(&p_sys->i_pkts_seq_lost, 0);
 
             unsigned rtp_fail = 0, line_fail = 0, hdrs = 0, hdrs_f2 = 0;
             unsigned bad_geo = 0, out_of_range = 0;
@@ -1303,6 +1345,15 @@ static void *SenderThread(void *data)
 
             msg_Warn(p_demux, "st2110: pkts=%u dropped=%u rtp_fail=%u line_fail=%u",
                      pkts, dropped, rtp_fail, line_fail);
+            /* Genuine wire-level loss (gaps in the RTP sequence number,
+               see TrackSequenceLoss()) -- distinct from `dropped` above
+               (our own queue backpressure) and from rtp_fail/line_fail
+               (packets that arrived but didn't parse). This is the same
+               check done manually with pktmon/Wireshark earlier in this
+               project, now always on. */
+            if (seq_lost)
+                msg_Warn(p_demux, "st2110: seq_lost=%u (packets that never "
+                         "arrived, per RTP sequence gaps)", seq_lost);
             if (p_sys->b_interlace)
                 msg_Warn(p_demux, "st2110: line headers total=%u field2=%u (%.1f%%)",
                          hdrs, hdrs_f2, hdrs ? 100.0 * hdrs_f2 / hdrs : 0.0);
@@ -1366,6 +1417,7 @@ static int Open(vlc_object_t *obj)
         return VLC_ENOMEM;
     p_demux->p_sys = p_sys;
     p_sys->fd = -1;
+    p_sys->i_last_rtp_seq = -1;  /* calloc() zeroed this; -1 means "no packet seen yet" */
 
     /* MRL is st2110://<group>:<port>; psz_location has the scheme already
        stripped by VLC's URL parser. */
