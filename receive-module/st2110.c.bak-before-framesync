@@ -276,13 +276,6 @@ typedef struct {
     atomic_uint pkts_line_fail;
     atomic_uint hdrs_total;
     atomic_uint hdrs_field2;
-    /* Headers that parsed fine but were then silently skipped inside
-       WriteLines() -- previously uncounted, so there was no way to tell
-       whether stale-looking picture regions were from real packet loss
-       (which pkts/line_fail above already show is ~0) or from our own
-       validity checks rejecting geometry that should have been good. */
-    atomic_uint hdrs_bad_geometry;  /* length/offset/width sanity checks */
-    atomic_uint hdrs_out_of_range;  /* MapLine() rejected or out_line >= height */
 } worker_stats_t;
 
 typedef struct {
@@ -334,26 +327,19 @@ struct demux_sys_t
     es_out_id_t *p_es;
     date_t       pts;
 
-    /* Double-buffered picture buffer: two full frame buffers, each
-       allocated and zeroed once and never cleared again. Workers always
-       write into whichever one active_write_idx currently names; the
-       worker whose decrement brings n_in_flight to zero (see
-       marker_pending above) flips active_write_idx to the other buffer
-       in the same breath as recording which one just became
-       completed_buf_idx, before signaling the sender. From that instant
-       no worker will ever write into completed_buf_idx again until a
-       full frame period later, so the sender can copy it out at its own
-       pace with no possibility of reading a buffer that's concurrently
-       being written -- unlike a single shared buffer, where the sender's
-       copy could in principle still land mid-write for whatever the
-       *next* frame's earliest packets touch first. Within one buffer,
-       no lock is needed for the writes themselves: RFC4175 guarantees
-       two different packets never target overlapping byte ranges (see
-       the file header comment), so concurrent writers into the same
-       buffer never race with each other either. */
-    uint8_t     *p_master_buf[2];
-    atomic_uint  active_write_idx;   /* which buffer workers write into */
-    atomic_uint  completed_buf_idx;  /* which buffer the sender should read */
+    /* Persistent picture buffer: allocated and zeroed once, then NEVER
+       cleared again. Every worker thread writes incoming pixels directly
+       into it at the position its own packet describes; the sender
+       thread periodically copies whatever is currently in it out to
+       es_out. No lock is needed for the writes: RFC4175 guarantees two
+       different packets never target overlapping byte ranges (see the
+       file header comment), so concurrent writers never race with each
+       other. The sender's snapshot copy can in principle race with an
+       in-progress write (a rare, cosmetically-torn line at worst) --
+       an accepted trade-off for a monitoring tool that would rather show
+       slightly-torn video than add synchronization back into the hot
+       path. */
+    uint8_t *p_master_buf;
     size_t   i_buf_size;
     size_t   i_y_plane_size;
     size_t   i_uv_plane_size;
@@ -397,45 +383,9 @@ struct demux_sys_t
     worker_stats_t *p_worker_stats;
     unsigned        n_workers_started;
 
-    /* sender thread: paced by SignalFrameComplete() below, not an
-       independent clock (see SenderThread() for why) */
+    /* sender thread: independent clock, decoupled from arrival timing */
     vlc_thread_t sender_thread;
     bool         b_sender_started;
-
-    /* Frame-complete signal from whichever worker processes the packet
-       carrying RFC4175's "last packet of this field/frame" marker bit
-       (see SignalFrameComplete()/ProcessPacket()). Only ever one waiter
-       (the sender thread), so this plain condvar is not subject to the
-       "wakes every waiter" issue documented on queue_sem above. */
-    vlc_mutex_t  frame_lock;
-    vlc_cond_t   frame_cond;
-    bool         b_frame_lock_inited;
-    bool         b_frame_cond_inited;
-    bool         b_frame_ready;   /* protected by frame_lock */
-    /* Diagnostic: how many times SignalFrameComplete() actually fired,
-       so the marker-bit assumption above can be checked against reality
-       instead of just trusted -- read/reset by the sender thread every
-       ~5s, alongside its other stats. */
-    atomic_uint  i_frame_signals;
-
-    /* Completion barrier for the marker-bit signal above: with N worker
-       threads all popping from one FIFO queue but finishing in whatever
-       order they finish (not necessarily the order they popped in),
-       "the worker that processed the marker packet is done" does NOT by
-       itself mean every earlier-queued packet has also finished being
-       written -- a slower worker could still be mid-write on one. That
-       gap caused visible block-corruption, not just tearing, when first
-       tried without this. n_in_flight counts packets that have been
-       popped but not yet fully processed (see QueuePop()/WorkerThread());
-       marker_pending is set when a worker sees the completing marker.
-       Whichever worker's decrement is the one that brings n_in_flight to
-       zero -- i.e. genuinely the last packet queued up to that point to
-       finish, regardless of which thread it happened to run on --
-       atomically claims marker_pending and fires the signal. This keeps
-       full N-way parallelism in the unpack stage (needed for weaker
-       hardware than this dev machine) while still being race-free. */
-    atomic_uint  n_in_flight;
-    atomic_bool  marker_pending;
 
     /* Cooperative shutdown signal: a blocked WaitForMultipleObjects()/
        poll()/vlc_cond_timedwait() is not guaranteed to be interrupted by
@@ -448,29 +398,10 @@ struct demux_sys_t
        Written only by the single receive thread, so this atomic is never
        contended; read and reset by the sender thread every ~5s. */
     atomic_uint i_pkts_total;
-
-    /* Wire-level loss, detected from gaps in the RTP sequence number
-       (see TrackSequenceLoss()) -- the same check done manually with an
-       external capture earlier in this project's life, now built in and
-       always on. UDP guarantees neither ordering nor delivery, so a gap
-       in the sequence can mean either genuine loss (the datagram was
-       discarded somewhere in the path and will never arrive) or benign
-       reordering (it took a different queue/path and is just running
-       late). TrackSequenceLoss() tells these apart with a 64-packet
-       trailing window before confirming a loss, rather than counting
-       every gap immediately. i_last_rtp_seq/seq_seen_bitmap are touched
-       only by the single receive thread (no synchronization needed);
-       i_last_rtp_seq == -1 means "haven't seen a first packet yet".
-       i_pkts_seq_lost is read/reset by the sender thread every ~5s like
-       the other counters. */
-    int          i_last_rtp_seq;
-    uint64_t     seq_seen_bitmap;
-    atomic_uint  i_pkts_seq_lost;
 };
 
 static int  Open(vlc_object_t *);
 static void Close(vlc_object_t *);
-static int  Demux(demux_t *);
 static int  Control(demux_t *, int, va_list);
 static void *ReceiveThread(void *);
 static void *WorkerThread(void *);
@@ -553,18 +484,13 @@ static void SetColorimetry(video_format_t *v, const char *psz_colorimetry)
 }
 
 /* Parses the fixed 12-byte RTP header (plus CSRC list / extension header if
- * present) and returns the byte offset where the RTP payload begins, plus
- * the marker bit (RFC4175: set on the last packet of each field's, or for
- * progressive the frame's, transmission -- used to know when a complete,
- * non-torn frame has just landed in the master buffer). */
-static int ParseRTP(const uint8_t *p, size_t len, unsigned *hdr_len, bool *out_marker)
+ * present) and returns the byte offset where the RTP payload begins. */
+static int ParseRTP(const uint8_t *p, size_t len, unsigned *hdr_len)
 {
     if (len < RTP_HDR_MIN_LEN)
         return -1;
     if ((p[0] >> 6) != 2)          /* RTP version must be 2 */
         return -1;
-
-    *out_marker = (p[1] & 0x80) != 0;
 
     unsigned cc = p[0] & 0x0f;
     bool ext = (p[0] & 0x10) != 0;
@@ -662,21 +588,19 @@ static bool MapLine(const demux_sys_t *p_sys, const rfc4175_line_hdr_t *h,
 }
 
 /* Unpacks RFC4175 YCbCr-4:2:2 10bit GPM pgroups (5 bytes -> Cb,Y0,Cr,Y1)
- * directly into buf_idx's Y/U/V planes (see the demux_sys_t comment on
- * p_master_buf for why the caller picks the buffer once up front rather
- * than this function re-reading active_write_idx itself). Called by
+ * directly into the persistent master buffer's Y/U/V planes. Called by
  * whichever worker thread dequeued this packet -- no lock: this packet's
  * target byte ranges never overlap another packet's (different line, or a
  * non-overlapping segment of the same line), so concurrent calls from
- * different worker threads writing into the same buffer are safe. */
-static void WriteLines(demux_sys_t *p_sys, worker_stats_t *stats, unsigned buf_idx,
+ * different worker threads are safe. */
+static void WriteLines(demux_sys_t *p_sys, worker_stats_t *stats,
                         const rfc4175_line_hdr_t *hdrs, unsigned n_hdrs,
                         const uint8_t *data, size_t data_len)
 {
     size_t off = 0;
     unsigned half_w = p_sys->i_width / 2;
 
-    uint8_t *buf = p_sys->p_master_buf[buf_idx];
+    uint8_t *buf = p_sys->p_master_buf;
     uint16_t *y_plane = (uint16_t *)buf;
     uint16_t *u_plane = (uint16_t *)(buf + p_sys->i_y_plane_size);
     uint16_t *v_plane = (uint16_t *)(buf + p_sys->i_y_plane_size
@@ -697,14 +621,12 @@ static void WriteLines(demux_sys_t *p_sys, worker_stats_t *stats, unsigned buf_i
             continue;
         }
         if (h->length % 5 != 0 || h->offset % 2 != 0 || h->offset >= p_sys->i_width) {
-            atomic_fetch_add(&stats->hdrs_bad_geometry, 1);
             off += h->length;
             continue;
         }
 
         unsigned out_line;
         if (!MapLine(p_sys, h, &out_line) || out_line >= p_sys->i_height) {
-            atomic_fetch_add(&stats->hdrs_out_of_range, 1);
             off += h->length;
             continue;
         }
@@ -738,35 +660,16 @@ static void WriteLines(demux_sys_t *p_sys, worker_stats_t *stats, unsigned buf_i
     }
 }
 
-/* Wakes the sender thread (see SenderThread()) to tell it a complete,
- * non-torn frame just finished landing in the master buffer. There is
- * only ever one waiter (the sender thread), so -- unlike QueuePush's
- * situation with many worker threads (see the file header comment) --
- * a plain vlc_cond_signal() here can't cause a thundering herd: there's
- * only one thread it could possibly wake. */
-static void SignalFrameComplete(demux_sys_t *p_sys)
-{
-    atomic_fetch_add(&p_sys->i_frame_signals, 1);
-    vlc_mutex_lock(&p_sys->frame_lock);
-    p_sys->b_frame_ready = true;
-    vlc_mutex_unlock(&p_sys->frame_lock);
-    vlc_cond_signal(&p_sys->frame_cond);
-}
-
 /* Parses one packet and writes its pixels straight into the master buffer.
  * Called by a worker thread with its own per-worker stats slot (see the
  * file header comment for why these are per-worker, not shared). No
- * frame/field bookkeeping is needed for CORRECT PLACEMENT of pixels --
- * each packet is fully self-describing (see file header) -- but the RTP
- * marker bit is still tracked for a different reason: knowing when a
- * complete frame is ready to be *sent*, so the sender thread doesn't have
- * to guess via an independent clock (see SenderThread()). */
+ * frame/field bookkeeping of any kind: each packet is fully self-describing
+ * (see file header). */
 static void ProcessPacket(demux_sys_t *p_sys, worker_stats_t *stats,
                            const uint8_t *pkt, size_t len)
 {
     unsigned hdr_len;
-    bool marker;
-    if (ParseRTP(pkt, len, &hdr_len, &marker) != 0) {
+    if (ParseRTP(pkt, len, &hdr_len) != 0) {
         atomic_fetch_add(&stats->pkts_rtp_fail, 1);
         return;
     }
@@ -790,104 +693,7 @@ static void ProcessPacket(demux_sys_t *p_sys, worker_stats_t *stats,
     }
 
     DetectLineMode(p_sys, hdrs, n_hdrs);
-    unsigned buf_idx = atomic_load(&p_sys->active_write_idx);
-    WriteLines(p_sys, stats, buf_idx, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
-
-    /* For interlace, only field two's marker completes a full woven
-       frame -- field one's marker just means "half done, field two still
-       to come". hdrs[0] stands in for the whole packet's field since a
-       single packet's chained SRD headers are always for one field.
-       This only marks the intent to signal; WorkerThread() is what
-       actually fires it, once every packet queued up to this point has
-       genuinely finished being written (see the n_in_flight/
-       marker_pending comment on demux_sys_t for why that distinction
-       matters with N parallel workers). */
-    if (marker && (!p_sys->b_interlace || hdrs[0].field2))
-        atomic_store(&p_sys->marker_pending, true);
-}
-
-/* Cheap peek at the RTP sequence number (header bytes 2-3) to detect
- * genuine wire-level loss -- independent of and before any full
- * header/line parsing. Called for every datagram the receive thread
- * gets, regardless of whether it later parses cleanly, so this measures
- * what actually arrived on the wire, not just what our own parser
- * accepted.
- *
- * UDP has no retransmission and no ordering guarantee. A datagram that
- * never arrives (discarded by a NIC ring buffer, a socket receive
- * buffer, or a switch queue somewhere along the path under load) is
- * gone for good -- that's real loss. But a gap in the sequence number
- * can *also* appear when a datagram is simply reordered (arrives a
- * position or two late, having taken a different queue/path) without
- * ever being lost at all. Naively counting every gap the instant it's
- * seen conflates the two and overcounts.
- *
- * seq_seen_bitmap tracks, as a 64-bit window trailing the highest
- * sequence number seen so far (bit 0 = that packet itself, bit k = the
- * packet k behind it), which of the last 64 sequence numbers have
- * actually been observed. A gap is only ever confirmed as lost once it
- * falls off the trailing edge of that window -- i.e. 64 more packets
- * have since arrived and it still never showed up. A reordered packet
- * arriving within the window retroactively marks its own bit, so it's
- * never confirmed lost.
- *
- * Only ever called from the single receive thread (see the file header
- * comment for why that's exactly one thread), so neither field needs
- * locking or atomics despite being read-then-written here every packet. */
-#define SEQ_WINDOW_BITS 64
-
-static void TrackSequenceLoss(demux_sys_t *p_sys, const uint8_t *data, size_t len)
-{
-    if (len < 4)
-        return;
-
-    uint16_t seq = ((uint16_t)data[2] << 8) | data[3];
-
-    if (p_sys->i_last_rtp_seq < 0) {
-        p_sys->i_last_rtp_seq = seq;
-        p_sys->seq_seen_bitmap = 1;
-        return;
-    }
-
-    uint16_t highest = (uint16_t)p_sys->i_last_rtp_seq;
-    int16_t delta = (int16_t)(seq - highest);
-
-    if (delta > 0) {
-        uint64_t old = p_sys->seq_seen_bitmap;
-        if ((unsigned)delta >= SEQ_WINDOW_BITS) {
-            /* Gap far bigger than the tracking window -- e.g. a stream
-               restart or a multi-second outage. Approximate by counting
-               the whole gap rather than trying to credit whatever the
-               old window partially saw; this path is rare, and the
-               delta<64 path below is where precision actually matters
-               (telling ordinary loss apart from reordering). */
-            atomic_fetch_add(&p_sys->i_pkts_seq_lost, (unsigned)delta - 1);
-            p_sys->seq_seen_bitmap = 1ULL;
-        } else {
-            /* Bits that fall off the trailing edge of the window (the
-               top `delta` bits of the old bitmap) that were never set
-               are now confirmed lost -- 64 packets' worth of chances
-               for a reordered arrival have passed. */
-            unsigned confirmed_lost = (unsigned)delta -
-                (unsigned)__builtin_popcountll(old >> (SEQ_WINDOW_BITS - delta));
-            if (confirmed_lost)
-                atomic_fetch_add(&p_sys->i_pkts_seq_lost, confirmed_lost);
-            p_sys->seq_seen_bitmap = (old << delta) | 1ULL;
-        }
-        p_sys->i_last_rtp_seq = seq;
-    } else if (delta < 0) {
-        /* Reordered or duplicate packet, behind the current high-water
-           mark. If it's still within the window, retroactively mark it
-           seen so it's never confirmed lost. If it's already fallen out
-           of the window, it's either already been confirmed lost (and
-           this very-late arrival can't undo that) or is a harmless
-           duplicate -- either way, too late to matter. */
-        unsigned back = (unsigned)(-delta);
-        if (back < SEQ_WINDOW_BITS)
-            p_sys->seq_seen_bitmap |= (1ULL << back);
-    }
-    /* delta == 0: exact duplicate of the current high-water mark,
-       already marked seen (bit 0). Nothing to do. */
+    WriteLines(p_sys, stats, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
 }
 
 /* Pushes a raw, not-yet-parsed datagram into the shared staging queue.
@@ -1194,8 +1000,6 @@ static void *ReceiveThread(void *data)
 
                 if (results[i].BytesTransferred > 0) {
                     atomic_fetch_add(&p_sys->i_pkts_total, 1);
-                    TrackSequenceLoss(p_sys, p_sys->p_rio_buf + (size_t)slot * RECV_BUF_LEN,
-                                       results[i].BytesTransferred);
                     QueuePush(p_sys, p_sys->p_rio_buf + (size_t)slot * RECV_BUF_LEN,
                               results[i].BytesTransferred);
                 }
@@ -1269,7 +1073,6 @@ static void *ReceiveThread(void *data)
                 break;
             }
             atomic_fetch_add(&p_sys->i_pkts_total, 1);
-            TrackSequenceLoss(p_sys, pkt, (size_t)len);
             QueuePush(p_sys, pkt, (size_t)len);
         }
 
@@ -1296,53 +1099,21 @@ static void *WorkerThread(void *data)
         size_t len;
         if (!QueuePop(p_sys, pkt, &len))
             break;
-        atomic_fetch_add(&p_sys->n_in_flight, 1);
 
         int canc = vlc_savecancel();
         ProcessPacket(p_sys, stats, pkt, len);
-
-        /* atomic_fetch_sub() returns the pre-decrement value, so == 1
-           means this decrement is the one that brought the count to
-           zero -- i.e. every packet popped up to and including this
-           moment has now genuinely finished being written, regardless
-           of which worker thread did the writing. Only then is it safe
-           to check/claim marker_pending (see the demux_sys_t comment for
-           why the two need to be checked together, not independently). */
-        if (atomic_fetch_sub(&p_sys->n_in_flight, 1) == 1) {
-            bool expected = true;
-            if (atomic_compare_exchange_strong(&p_sys->marker_pending, &expected, false)) {
-                /* Flip which buffer workers write into *before* telling
-                   the sender which one just became safe to read (see the
-                   demux_sys_t comment on p_master_buf). n_in_flight is
-                   genuinely zero right now -- no other worker is mid-
-                   write -- so nothing can still be writing into the
-                   buffer we're about to hand off. */
-                unsigned old_idx = atomic_load(&p_sys->active_write_idx);
-                atomic_store(&p_sys->completed_buf_idx, old_idx);
-                atomic_store(&p_sys->active_write_idx, old_idx ^ 1);
-                SignalFrameComplete(p_sys);
-            }
-        }
-
         vlc_restorecancel(canc);
     }
 
     return NULL;
 }
 
-/* Sender thread: paced by whichever worker calls SignalFrameComplete()
- * (see ProcessPacket()) when a complete, non-torn frame just finished
- * landing in the master buffer, rather than ticking on an independent
- * clock. The earlier independent-clock design had no idea whether a
- * write was mid-flight when it snapshotted, so it could (and, per a
- * visible horizontal-tearing artifact, did) grab a frame that was half
- * this field and half the previous one. Waiting for the real field/frame
- * boundary instead eliminates that at the source. The wait is still
- * bounded (one frame interval -- see the note below on why not more) as
- * a fallback for a missed marker or a stalled/lost stream, so this
- * thread can't wedge; packet loss still just means some pixels are one
- * tick stale, never a discarded or blanked frame. Also owns the periodic
- * (~5s) diagnostic log. */
+/* Independent sender thread: ticks on its own clock at the stream's
+ * declared frame rate, completely decoupled from arrival timing. Each
+ * tick just snapshots whatever is currently in the master buffer and
+ * sends it -- packet loss just means some pixels are one tick stale,
+ * never a discarded or blanked frame. Also owns the periodic (~5s)
+ * diagnostic log, since it already wakes on a steady schedule. */
 static void *SenderThread(void *data)
 {
     demux_t *p_demux = data;
@@ -1354,27 +1125,22 @@ static void *SenderThread(void *data)
         if (atomic_load(&p_sys->b_stop_requested))
             break;
 
-        vlc_mutex_lock(&p_sys->frame_lock);
-        if (!p_sys->b_frame_ready)
-            /* Real-world senders don't all set the RTP marker bit on
-               every single frame (confirmed via the frame_signals log
-               below landing at ~75-80% of the expected count, not 0% or
-               100%) -- so this fallback isn't a rare safety net, it's a
-               regular occurrence. Bounding it to exactly one frame
-               interval, not more, matters: anything longer adds that
-               much extra latency on every frame the marker misses. */
-            vlc_cond_timedwait(&p_sys->frame_cond, &p_sys->frame_lock,
-                                mdate() + frame_interval);
-        p_sys->b_frame_ready = false;
-        vlc_mutex_unlock(&p_sys->frame_lock);
+        /* A plain relative sleep, not "wait until an absolute deadline":
+           the latter can degenerate into a busy spin (zero actual wait)
+           if any single iteration -- e.g. es_out_Send() blocking on a
+           congested decoder fifo -- ever takes longer than one frame
+           interval, since the next deadline would already be in the past
+           by the time it's computed. A relative sleep always waits at
+           least close to frame_interval no matter how the previous
+           iteration went. */
+        msleep(frame_interval);
 
         if (atomic_load(&p_sys->b_stop_requested))
             break;
 
         block_t *p_block = block_Alloc(p_sys->i_buf_size);
         if (p_block) {
-            unsigned buf_idx = atomic_load(&p_sys->completed_buf_idx);
-            memcpy(p_block->p_buffer, p_sys->p_master_buf[buf_idx], p_sys->i_buf_size);
+            memcpy(p_block->p_buffer, p_sys->p_master_buf, p_sys->i_buf_size);
             p_block->i_dts = p_block->i_pts = date_Get(&p_sys->pts);
             /* WriteLines() already weaves both fields into one frame (see
                MapLine()), but without this flag VLC's own deinterlace
@@ -1390,97 +1156,30 @@ static void *SenderThread(void *data)
         }
         date_Increment(&p_sys->pts, 1);
 
-#if 0   /* TEMPORARILY DISABLED: user asked for a "pure" build with no
-           diagnostic logging, to check whether it's a factor in a
-           reported gradual slowdown (possibly VLC's own message
-           console accumulating text over a long session, not this
-           module's own processing cost -- the atomic_exchange() calls
-           below are cheap regardless of whether their results get
-           logged). Re-enable by flipping this to `#if 1` once that's
-           been isolated. */
         if (mdate() - stat_window_start > 5 * CLOCK_FREQ) {
-            unsigned pkts     = atomic_exchange(&p_sys->i_pkts_total, 0);
-            unsigned dropped  = atomic_exchange(&p_sys->i_pkts_dropped_queue_full, 0);
-            unsigned signals  = atomic_exchange(&p_sys->i_frame_signals, 0);
-            unsigned seq_lost = atomic_exchange(&p_sys->i_pkts_seq_lost, 0);
+            unsigned pkts    = atomic_exchange(&p_sys->i_pkts_total, 0);
+            unsigned dropped = atomic_exchange(&p_sys->i_pkts_dropped_queue_full, 0);
 
             unsigned rtp_fail = 0, line_fail = 0, hdrs = 0, hdrs_f2 = 0;
-            unsigned bad_geo = 0, out_of_range = 0;
             for (unsigned i = 0; i < p_sys->n_threads; i++) {
                 worker_stats_t *ws = &p_sys->p_worker_stats[i];
-                rtp_fail     += atomic_exchange(&ws->pkts_rtp_fail, 0);
-                line_fail    += atomic_exchange(&ws->pkts_line_fail, 0);
-                hdrs         += atomic_exchange(&ws->hdrs_total, 0);
-                hdrs_f2      += atomic_exchange(&ws->hdrs_field2, 0);
-                bad_geo      += atomic_exchange(&ws->hdrs_bad_geometry, 0);
-                out_of_range += atomic_exchange(&ws->hdrs_out_of_range, 0);
+                rtp_fail  += atomic_exchange(&ws->pkts_rtp_fail, 0);
+                line_fail += atomic_exchange(&ws->pkts_line_fail, 0);
+                hdrs      += atomic_exchange(&ws->hdrs_total, 0);
+                hdrs_f2   += atomic_exchange(&ws->hdrs_field2, 0);
             }
 
             msg_Warn(p_demux, "st2110: pkts=%u dropped=%u rtp_fail=%u line_fail=%u",
                      pkts, dropped, rtp_fail, line_fail);
-            /* Confirmed wire-level loss (see TrackSequenceLoss()) --
-               distinct from `dropped` above (our own queue backpressure)
-               and from rtp_fail/line_fail (packets that arrived but
-               didn't parse). Reorder-tolerant: a gap isn't counted here
-               until 64 more packets have arrived after it without it
-               ever showing up, so this excludes ordinary reordering and
-               only reflects packets that are genuinely never coming. */
-            if (seq_lost)
-                msg_Warn(p_demux, "st2110: seq_lost=%u (confirmed lost, "
-                         "reorder-tolerant)", seq_lost);
             if (p_sys->b_interlace)
                 msg_Warn(p_demux, "st2110: line headers total=%u field2=%u (%.1f%%)",
                          hdrs, hdrs_f2, hdrs ? 100.0 * hdrs_f2 / hdrs : 0.0);
-            /* Headers that parsed correctly but were then rejected before
-               ever reaching the master buffer -- i.e. valid data that our
-               OWN checks discarded, not data lost on the wire. Any
-               nonzero count here is a direct, exact measure of pixels
-               that stayed stale (carried over from a previous write)
-               instead of being refreshed this cycle. */
-            if (bad_geo || out_of_range)
-                msg_Warn(p_demux, "st2110: headers rejected: bad_geometry=%u "
-                         "out_of_range=%u (this many stayed stale instead of "
-                         "being refreshed)", bad_geo, out_of_range);
-            /* Sanity check for the RTP-marker-bit assumption SenderThread
-               now relies on: over 5s, this should land close to
-               5*(fps_num/fps_den) -- e.g. ~150 for 29.97fps. Near 0 means
-               this sender never sets the marker bit, and the sender
-               thread is silently running on its bounded fallback timeout
-               the whole time instead of the real frame boundary. */
-            msg_Warn(p_demux, "st2110: frame_signals=%u (expected ~%.0f/5s if the "
-                     "sender sets the RTP marker bit)",
-                     signals, 5.0 * p_sys->i_fps_num / p_sys->i_fps_den);
 
             stat_window_start = mdate();
         }
-#else
-        (void)stat_window_start;
-#endif
     }
 
     return NULL;
-}
-
-/* Minimal no-op pf_demux(): our real data delivery is entirely
- * asynchronous (SenderThread pushes via es_out_Send on its own schedule,
- * independent of this ever being called -- see the file header comment).
- * This exists only so VLC's input thread has something to call in its
- * normal main loop; leaving pf_demux NULL (as before) also appeared to
- * stop VLC from properly servicing an attached --input-slave (e.g. a
- * separate AES67/ST2110-30 audio SDP opened alongside this as the video
- * master), which needs the main input's loop to keep turning to pump the
- * slave too -- audio went silent specifically when this module was the
- * main input with pf_demux == NULL. A short sleep keeps this from
- * busy-spinning; returning 1 just means "nothing fatal, call again". */
-static int Demux(demux_t *p_demux)
-{
-    demux_sys_t *p_sys = p_demux->p_sys;
-    if (atomic_load(&p_sys->b_stop_requested))
-        return 0;
-    msleep(10000); /* 10ms: frequent enough to keep VLC's input loop (and
-                       whatever slave-servicing rides along with it)
-                       turning, without spinning uselessly. */
-    return 1;
 }
 
 static int Control(demux_t *p_demux, int query, va_list args)
@@ -1516,7 +1215,6 @@ static int Open(vlc_object_t *obj)
         return VLC_ENOMEM;
     p_demux->p_sys = p_sys;
     p_sys->fd = -1;
-    p_sys->i_last_rtp_seq = -1;  /* calloc() zeroed this; -1 means "no packet seen yet" */
 
     /* MRL is st2110://<group>:<port>; psz_location has the scheme already
        stripped by VLC's URL parser. */
@@ -1603,9 +1301,8 @@ static int Open(vlc_object_t *obj)
     p_sys->i_y_plane_size  = (size_t)p_sys->i_width * p_sys->i_height * 2;
     p_sys->i_uv_plane_size = (size_t)(p_sys->i_width / 2) * p_sys->i_height * 2;
     p_sys->i_buf_size = p_sys->i_y_plane_size + 2 * p_sys->i_uv_plane_size;
-    p_sys->p_master_buf[0] = calloc(1, p_sys->i_buf_size);
-    p_sys->p_master_buf[1] = calloc(1, p_sys->i_buf_size);
-    if (!p_sys->p_master_buf[0] || !p_sys->p_master_buf[1])
+    p_sys->p_master_buf = calloc(1, p_sys->i_buf_size);
+    if (!p_sys->p_master_buf)
         goto error;
 
     es_format_t fmt;
@@ -1627,11 +1324,7 @@ static int Open(vlc_object_t *obj)
     date_Init(&p_sys->pts, p_sys->i_fps_num, p_sys->i_fps_den);
     date_Set(&p_sys->pts, VLC_TS_0);
 
-    /* Real data still arrives asynchronously via the sender thread, not
-       through this callback (see Demux()'s own comment for why it's a
-       no-op that exists only to keep VLC's input loop -- and whatever
-       --input-slave servicing rides along with it -- turning). */
-    p_demux->pf_demux = Demux;
+    p_demux->pf_demux = NULL;      /* live source: pushed asynchronously by the sender thread */
     p_demux->pf_control = Control;
 
     msg_Info(p_demux, "st2110: %s:%d %ux%u interlace=%d fps=%u/%u workers=%u",
@@ -1662,13 +1355,6 @@ static int Open(vlc_object_t *obj)
     p_sys->worker_threads = calloc(p_sys->n_threads, sizeof(vlc_thread_t));
     if (!p_sys->p_worker_stats || !p_sys->p_worker_args || !p_sys->worker_threads)
         goto error;
-
-    /* Frame-complete signal between whichever worker sees a field/frame's
-       last packet and the sender thread (see SignalFrameComplete()). */
-    vlc_mutex_init(&p_sys->frame_lock);
-    p_sys->b_frame_lock_inited = true;
-    vlc_cond_init(&p_sys->frame_cond);
-    p_sys->b_frame_cond_inited = true;
 
     if (vlc_clone(&p_sys->receive_thread, ReceiveThread, p_demux, VLC_THREAD_PRIORITY_INPUT)) {
         msg_Err(p_demux, "st2110: failed to spawn receive thread");
@@ -1747,11 +1433,6 @@ static void Close(vlc_object_t *obj)
     free(p_sys->p_worker_args);
     free(p_sys->p_worker_stats);
 
-    if (p_sys->b_frame_cond_inited)
-        vlc_cond_destroy(&p_sys->frame_cond);
-    if (p_sys->b_frame_lock_inited)
-        vlc_mutex_destroy(&p_sys->frame_lock);
-
 #ifdef _WIN32
     if (p_sys->queue_sem)
         CloseHandle(p_sys->queue_sem);
@@ -1767,8 +1448,7 @@ static void Close(vlc_object_t *obj)
         net_Close(p_sys->fd);
 
     free(p_sys->psz_source);
-    free(p_sys->p_master_buf[0]);
-    free(p_sys->p_master_buf[1]);
+    free(p_sys->p_master_buf);
     free(p_sys);
     p_demux->p_sys = NULL;
 }
