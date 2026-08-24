@@ -462,6 +462,7 @@ struct demux_sys_t
 
 static int  Open(vlc_object_t *);
 static void Close(vlc_object_t *);
+static int  Demux(demux_t *);
 static int  Control(demux_t *, int, va_list);
 static void *ReceiveThread(void *);
 static void *WorkerThread(void *);
@@ -1384,6 +1385,28 @@ static void *SenderThread(void *data)
     return NULL;
 }
 
+/* Minimal no-op pf_demux(): our real data delivery is entirely
+ * asynchronous (SenderThread pushes via es_out_Send on its own schedule,
+ * independent of this ever being called -- see the file header comment).
+ * This exists only so VLC's input thread has something to call in its
+ * normal main loop; leaving pf_demux NULL (as before) also appeared to
+ * stop VLC from properly servicing an attached --input-slave (e.g. a
+ * separate AES67/ST2110-30 audio SDP opened alongside this as the video
+ * master), which needs the main input's loop to keep turning to pump the
+ * slave too -- audio went silent specifically when this module was the
+ * main input with pf_demux == NULL. A short sleep keeps this from
+ * busy-spinning; returning 1 just means "nothing fatal, call again". */
+static int Demux(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    if (atomic_load(&p_sys->b_stop_requested))
+        return 0;
+    msleep(10000); /* 10ms: frequent enough to keep VLC's input loop (and
+                       whatever slave-servicing rides along with it)
+                       turning, without spinning uselessly. */
+    return 1;
+}
+
 static int Control(demux_t *p_demux, int query, va_list args)
 {
     switch (query) {
@@ -1528,7 +1551,11 @@ static int Open(vlc_object_t *obj)
     date_Init(&p_sys->pts, p_sys->i_fps_num, p_sys->i_fps_den);
     date_Set(&p_sys->pts, VLC_TS_0);
 
-    p_demux->pf_demux = NULL;      /* live source: pushed asynchronously by the sender thread */
+    /* Real data still arrives asynchronously via the sender thread, not
+       through this callback (see Demux()'s own comment for why it's a
+       no-op that exists only to keep VLC's input loop -- and whatever
+       --input-slave servicing rides along with it -- turning). */
+    p_demux->pf_demux = Demux;
     p_demux->pf_control = Control;
 
     msg_Info(p_demux, "st2110: %s:%d %ux%u interlace=%d fps=%u/%u workers=%u",
