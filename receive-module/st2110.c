@@ -363,9 +363,16 @@ struct demux_sys_t
     unsigned      i_queue_tail;
     unsigned      i_queue_count;
     vlc_mutex_t   queue_lock;
-    vlc_cond_t    queue_not_empty;
     bool          b_queue_lock_inited;
+#ifdef _WIN32
+    /* Windows: a semaphore instead of vlc_cond_t (see QueuePush()/
+       QueuePop() for why -- vlc_cond_signal() was found, via a captured
+       thread stack, to wake every waiter instead of just one). */
+    HANDLE        queue_sem;
+#else
+    vlc_cond_t    queue_not_empty;
     bool          b_queue_cond_inited;
+#endif
     atomic_uint   i_pkts_dropped_queue_full;
 
     /* Worker threads: N of these pop raw packets off p_queue and run the
@@ -712,15 +719,61 @@ static void QueuePush(demux_sys_t *p_sys, const uint8_t *data, size_t len)
     p_sys->i_queue_count++;
     vlc_mutex_unlock(&p_sys->queue_lock);
 
+#ifdef _WIN32
+    /* Not vlc_cond_signal(): live profiling (Process Explorer, a captured
+       thread stack) caught this call chain pegging a core --
+       QueuePush -> vlc_cond_signal -> ... -> RtlWakeAllConditionVariable.
+       On this VLC/Windows build, vlc_cond_signal() wakes *every* waiter,
+       not just one -- with N worker threads blocked in QueuePop below,
+       every single packet arrival was waking all of them, most of which
+       just found the queue empty (one item, many waiters) and went back
+       to sleep. That's an O(N) kernel-mode thundering herd on every one
+       of a few hundred thousand packets per second. A semaphore doesn't
+       have this problem: ReleaseSemaphore(sem, 1, ...) is guaranteed by
+       the OS to wake at most one waiter. POSIX is unaffected --
+       pthread_cond_signal there really does wake only one -- so it still
+       uses the plain vlc_cond_t path below. */
+    ReleaseSemaphore(p_sys->queue_sem, 1, NULL);
+#else
     vlc_cond_signal(&p_sys->queue_not_empty);
+#endif
 }
 
 /* Pops one raw datagram for a worker thread to process. Returns false only
  * once shutdown has been requested AND the queue has fully drained -- any
  * packets still queued at shutdown are processed first, so nothing queued
  * is silently discarded. The wait is bounded (500ms) purely so the stop
- * flag gets rechecked even if a signal is ever missed; it is not the
- * primary wakeup path (vlc_cond_signal from QueuePush is). */
+ * flag gets rechecked even if a signal/release is ever missed; it is not
+ * the primary wakeup path (QueuePush's own signal/release is). */
+#ifdef _WIN32
+static bool QueuePop(demux_sys_t *p_sys, uint8_t *out_data, size_t *out_len)
+{
+    for (;;) {
+        DWORD w = WaitForSingleObject(p_sys->queue_sem, 500);
+        if (w == WAIT_OBJECT_0)
+            break;
+        if (atomic_load(&p_sys->b_stop_requested))
+            return false;
+        /* WAIT_TIMEOUT: recheck the stop flag and keep waiting. Any other
+           result means the semaphore itself is gone -- nothing more this
+           thread can do. */
+        if (w != WAIT_TIMEOUT)
+            return false;
+    }
+
+    /* The semaphore count exactly mirrors i_queue_count increments from
+       QueuePush, so a successful wait here guarantees an item is
+       present -- no need to loop/recheck under the lock. */
+    vlc_mutex_lock(&p_sys->queue_lock);
+    queue_slot_t *slot = &p_sys->p_queue[p_sys->i_queue_head];
+    memcpy(out_data, slot->data, slot->len);
+    *out_len = slot->len;
+    p_sys->i_queue_head = (p_sys->i_queue_head + 1) % p_sys->i_queue_cap;
+    p_sys->i_queue_count--;
+    vlc_mutex_unlock(&p_sys->queue_lock);
+    return true;
+}
+#else
 static bool QueuePop(demux_sys_t *p_sys, uint8_t *out_data, size_t *out_len)
 {
     vlc_mutex_lock(&p_sys->queue_lock);
@@ -741,6 +794,7 @@ static bool QueuePop(demux_sys_t *p_sys, uint8_t *out_data, size_t *out_len)
     vlc_mutex_unlock(&p_sys->queue_lock);
     return true;
 }
+#endif
 
 #ifdef _WIN32
 /* Retrieves the RIO extension function table for a RIO-capable socket
@@ -1276,8 +1330,16 @@ static int Open(vlc_object_t *obj)
         goto error;
     vlc_mutex_init(&p_sys->queue_lock);
     p_sys->b_queue_lock_inited = true;
+#ifdef _WIN32
+    p_sys->queue_sem = CreateSemaphore(NULL, 0, QUEUE_CAPACITY, NULL);
+    if (!p_sys->queue_sem) {
+        msg_Err(p_demux, "st2110: CreateSemaphore failed for queue");
+        goto error;
+    }
+#else
     vlc_cond_init(&p_sys->queue_not_empty);
     p_sys->b_queue_cond_inited = true;
+#endif
 
     p_sys->p_worker_stats = calloc(p_sys->n_threads, sizeof(worker_stats_t));
     p_sys->p_worker_args  = calloc(p_sys->n_threads, sizeof(worker_arg_t));
@@ -1362,8 +1424,13 @@ static void Close(vlc_object_t *obj)
     free(p_sys->p_worker_args);
     free(p_sys->p_worker_stats);
 
+#ifdef _WIN32
+    if (p_sys->queue_sem)
+        CloseHandle(p_sys->queue_sem);
+#else
     if (p_sys->b_queue_cond_inited)
         vlc_cond_destroy(&p_sys->queue_not_empty);
+#endif
     if (p_sys->b_queue_lock_inited)
         vlc_mutex_destroy(&p_sys->queue_lock);
     free(p_sys->p_queue);
