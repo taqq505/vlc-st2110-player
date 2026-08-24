@@ -80,6 +80,101 @@
 # include <ws2tcpip.h>
 # include <mswsock.h>
 # define poll(fds, nfds, timeout) WSAPoll((fds), (nfds), (timeout))
+
+/* The MinGW-w64 toolchain used to build this (mingw-w64-x86_64-gcc via
+ * MSYS2) does not declare Registered I/O (RIO) in its mswsock.h --
+ * verified directly (build failure: RIO_EXTENSION_FUNCTION_TABLE and
+ * friends undeclared). RIO is accessed entirely through function
+ * pointers obtained at runtime via WSAIoctl(), never linked from an
+ * import library, so it's safe to declare the types/constants locally;
+ * these are transcribed verbatim from the official Windows SDK's
+ * mswsock.h/mswsockdef.h (Windows 8+ ABI, stable since 2012). Guarded so
+ * this becomes a no-op if a future MinGW-w64 version adds them itself. */
+# ifndef RIO_CORRUPT_CQ
+typedef struct RIO_BUFFERID_t *RIO_BUFFERID;
+typedef struct RIO_CQ_t       *RIO_CQ;
+typedef struct RIO_RQ_t       *RIO_RQ;
+
+#  define RIO_INVALID_BUFFERID ((RIO_BUFFERID)(ULONG_PTR)0xFFFFFFFF)
+#  define RIO_INVALID_CQ       ((RIO_CQ)0)
+#  define RIO_INVALID_RQ       ((RIO_RQ)0)
+#  define RIO_CORRUPT_CQ       0xFFFFFFFF
+
+typedef struct _RIO_BUF {
+    RIO_BUFFERID BufferId;
+    ULONG        Offset;
+    ULONG        Length;
+} RIO_BUF, *PRIO_BUF;
+
+typedef struct _RIORESULT {
+    LONG      Status;
+    ULONG     BytesTransferred;
+    ULONGLONG SocketContext;
+    ULONGLONG RequestContext;
+} RIORESULT, *PRIORESULT;
+
+typedef enum _RIO_NOTIFICATION_COMPLETION_TYPE {
+    RIO_EVENT_COMPLETION = 1,
+    RIO_IOCP_COMPLETION  = 2,
+} RIO_NOTIFICATION_COMPLETION_TYPE;
+
+typedef struct _RIO_NOTIFICATION_COMPLETION {
+    RIO_NOTIFICATION_COMPLETION_TYPE Type;
+    union {
+        struct {
+            HANDLE EventHandle;
+            BOOL   NotifyReset;
+        } Event;
+        struct {
+            HANDLE IocpHandle;
+            PVOID  CompletionKey;
+            PVOID  Overlapped;
+        } Iocp;
+    };
+} RIO_NOTIFICATION_COMPLETION, *PRIO_NOTIFICATION_COMPLETION;
+
+typedef BOOL     (WSAAPI *LPFN_RIORECEIVE)(RIO_RQ, PRIO_BUF, ULONG, DWORD, PVOID);
+typedef INT      (WSAAPI *LPFN_RIORECEIVEEX)(RIO_RQ, PRIO_BUF, ULONG, PRIO_BUF, PRIO_BUF, PRIO_BUF, PRIO_BUF, DWORD, PVOID);
+typedef BOOL     (WSAAPI *LPFN_RIOSEND)(RIO_RQ, PRIO_BUF, ULONG, DWORD, PVOID);
+typedef BOOL     (WSAAPI *LPFN_RIOSENDEX)(RIO_RQ, PRIO_BUF, ULONG, PRIO_BUF, PRIO_BUF, PRIO_BUF, PRIO_BUF, DWORD, PVOID);
+typedef VOID     (WSAAPI *LPFN_RIOCLOSECOMPLETIONQUEUE)(RIO_CQ);
+typedef RIO_CQ   (WSAAPI *LPFN_RIOCREATECOMPLETIONQUEUE)(DWORD, PRIO_NOTIFICATION_COMPLETION);
+typedef RIO_RQ   (WSAAPI *LPFN_RIOCREATEREQUESTQUEUE)(SOCKET, ULONG, ULONG, ULONG, ULONG, RIO_CQ, RIO_CQ, PVOID);
+typedef ULONG    (WSAAPI *LPFN_RIODEQUEUECOMPLETION)(RIO_CQ, PRIORESULT, ULONG);
+typedef VOID     (WSAAPI *LPFN_RIODEREGISTERBUFFER)(RIO_BUFFERID);
+typedef INT      (WSAAPI *LPFN_RIONOTIFY)(RIO_CQ);
+typedef RIO_BUFFERID (WSAAPI *LPFN_RIOREGISTERBUFFER)(PCHAR, DWORD);
+typedef BOOL     (WSAAPI *LPFN_RIORESIZECOMPLETIONQUEUE)(RIO_CQ, DWORD);
+typedef BOOL     (WSAAPI *LPFN_RIORESIZEREQUESTQUEUE)(RIO_RQ, DWORD, DWORD);
+
+typedef struct _RIO_EXTENSION_FUNCTION_TABLE {
+    DWORD                          cbSize;
+    LPFN_RIORECEIVE                RIOReceive;
+    LPFN_RIORECEIVEEX              RIOReceiveEx;
+    LPFN_RIOSEND                   RIOSend;
+    LPFN_RIOSENDEX                 RIOSendEx;
+    LPFN_RIOCLOSECOMPLETIONQUEUE   RIOCloseCompletionQueue;
+    LPFN_RIOCREATECOMPLETIONQUEUE  RIOCreateCompletionQueue;
+    LPFN_RIOCREATEREQUESTQUEUE     RIOCreateRequestQueue;
+    LPFN_RIODEQUEUECOMPLETION      RIODequeueCompletion;
+    LPFN_RIODEREGISTERBUFFER       RIODeregisterBuffer;
+    LPFN_RIONOTIFY                 RIONotify;
+    LPFN_RIOREGISTERBUFFER         RIORegisterBuffer;
+    LPFN_RIORESIZECOMPLETIONQUEUE  RIOResizeCompletionQueue;
+    LPFN_RIORESIZEREQUESTQUEUE     RIOResizeRequestQueue;
+} RIO_EXTENSION_FUNCTION_TABLE, *PRIO_EXTENSION_FUNCTION_TABLE;
+
+#  ifndef SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER
+   /* _WSAIORW(IOC_WS2,36), spelled out numerically since this MinGW's
+      headers don't reliably define all of _WSAIORW/IOC_WS2 either. */
+#   define SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER 0xC8000024
+#  endif
+
+static const GUID st2110_WSAID_MULTIPLE_RIO = {
+    0x8509e081, 0x96dd, 0x4005, { 0xb1, 0x65, 0x9e, 0x2e, 0xe8, 0xc7, 0x9e, 0x3f }
+};
+#  define WSAID_MULTIPLE_RIO st2110_WSAID_MULTIPLE_RIO
+# endif /* !RIO_CORRUPT_CQ */
 #endif
 
 #ifdef HAVE_CONFIG_H
@@ -671,6 +766,15 @@ static int OpenRioSocket(demux_t *p_demux)
 {
     demux_sys_t *p_sys = p_demux->p_sys;
 
+    /* Sentinels matching what Close() checks each resource against, so
+       that whichever step below fails, Close()'s existing RIO cleanup
+       block (gated on b_rio_inited, set just below once the socket
+       exists) can safely no-op on every resource this call never got to
+       allocate. */
+    p_sys->rio_buf_id = RIO_INVALID_BUFFERID;
+    p_sys->rio_cq = RIO_INVALID_CQ;
+    p_sys->rio_rq = RIO_INVALID_RQ;
+
     struct in_addr group_addr, source_addr;
     if (InetPtonA(AF_INET, p_sys->psz_group, &group_addr) != 1) {
         msg_Err(p_demux, "st2110: invalid group address \"%s\"", p_sys->psz_group);
@@ -688,6 +792,12 @@ static int OpenRioSocket(demux_t *p_demux)
         msg_Err(p_demux, "st2110: WSASocket failed (err=%d)", WSAGetLastError());
         return VLC_EGENERIC;
     }
+    /* From here on, p_sys->fd owns this socket and b_rio_inited marks
+       that Close() is responsible for tearing down whatever RIO state
+       got created below -- so no branch below needs its own
+       closesocket(), avoiding any risk of double-closing it. */
+    p_sys->fd = (int)s;
+    p_sys->b_rio_inited = true;
 
     BOOL reuse = TRUE;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
@@ -701,7 +811,6 @@ static int OpenRioSocket(demux_t *p_demux)
     addr.sin_port = htons((u_short)p_sys->i_port);
     if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
         msg_Err(p_demux, "st2110: bind failed (err=%d)", WSAGetLastError());
-        closesocket(s);
         return VLC_EGENERIC;
     }
 
@@ -714,7 +823,6 @@ static int OpenRioSocket(demux_t *p_demux)
         if (setsockopt(s, IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP,
                         (const char *)&mreq, sizeof(mreq)) == SOCKET_ERROR) {
             msg_Err(p_demux, "st2110: IP_ADD_SOURCE_MEMBERSHIP failed (err=%d)", WSAGetLastError());
-            closesocket(s);
             return VLC_EGENERIC;
         }
     } else {
@@ -725,14 +833,12 @@ static int OpenRioSocket(demux_t *p_demux)
         if (setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP,
                         (const char *)&mreq, sizeof(mreq)) == SOCKET_ERROR) {
             msg_Err(p_demux, "st2110: IP_ADD_MEMBERSHIP failed (err=%d)", WSAGetLastError());
-            closesocket(s);
             return VLC_EGENERIC;
         }
     }
 
     if (!GetRioFunctionTable(s, &p_sys->rio)) {
         msg_Err(p_demux, "st2110: failed to get RIO function table (err=%d)", WSAGetLastError());
-        closesocket(s);
         return VLC_EGENERIC;
     }
 
@@ -740,21 +846,18 @@ static int OpenRioSocket(demux_t *p_demux)
     p_sys->p_rio_buf = VirtualAlloc(NULL, total_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!p_sys->p_rio_buf) {
         msg_Err(p_demux, "st2110: VirtualAlloc failed for RIO buffer");
-        closesocket(s);
         return VLC_EGENERIC;
     }
 
     p_sys->rio_buf_id = p_sys->rio.RIORegisterBuffer((PCHAR)p_sys->p_rio_buf, (DWORD)total_size);
     if (p_sys->rio_buf_id == RIO_INVALID_BUFFERID) {
         msg_Err(p_demux, "st2110: RIORegisterBuffer failed (err=%d)", WSAGetLastError());
-        closesocket(s);
         return VLC_EGENERIC;
     }
 
     p_sys->rio_event = CreateEvent(NULL, TRUE /* manual reset */, FALSE, NULL);
     if (!p_sys->rio_event) {
         msg_Err(p_demux, "st2110: CreateEvent failed for RIO");
-        closesocket(s);
         return VLC_EGENERIC;
     }
 
@@ -765,9 +868,8 @@ static int OpenRioSocket(demux_t *p_demux)
     notify.Event.NotifyReset = TRUE;
 
     p_sys->rio_cq = p_sys->rio.RIOCreateCompletionQueue(RIO_CQ_SIZE, &notify);
-    if (p_sys->rio_cq == RIO_CORRUPT_CQ) {
+    if (p_sys->rio_cq == RIO_INVALID_CQ) {
         msg_Err(p_demux, "st2110: RIOCreateCompletionQueue failed (err=%d)", WSAGetLastError());
-        closesocket(s);
         return VLC_EGENERIC;
     }
 
@@ -775,7 +877,6 @@ static int OpenRioSocket(demux_t *p_demux)
                                                        p_sys->rio_cq, p_sys->rio_cq, NULL);
     if (p_sys->rio_rq == RIO_INVALID_RQ) {
         msg_Err(p_demux, "st2110: RIOCreateRequestQueue failed (err=%d)", WSAGetLastError());
-        closesocket(s);
         return VLC_EGENERIC;
     }
 
@@ -788,8 +889,6 @@ static int OpenRioSocket(demux_t *p_demux)
             msg_Warn(p_demux, "st2110: RIOReceive failed to post buffer %lu (err=%d)", i, WSAGetLastError());
     }
 
-    p_sys->fd = (int)s;
-    p_sys->b_rio_inited = true;
     return VLC_SUCCESS;
 }
 
@@ -1219,7 +1318,7 @@ static void Close(vlc_object_t *obj)
     if (p_sys->b_rio_inited) {
         if (p_sys->rio_buf_id != RIO_INVALID_BUFFERID)
             p_sys->rio.RIODeregisterBuffer(p_sys->rio_buf_id);
-        if (p_sys->rio_cq != RIO_CORRUPT_CQ)
+        if (p_sys->rio_cq != RIO_INVALID_CQ)
             p_sys->rio.RIOCloseCompletionQueue(p_sys->rio_cq);
         if (p_sys->rio_event)
             CloseHandle(p_sys->rio_event);
