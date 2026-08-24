@@ -64,6 +64,25 @@
  *     most of that per-packet kernel-transition cost. Published RIO
  *     benchmarks reach 180k-450k+ pkts/sec on a single socket, comfortably
  *     past the wall this module was hitting.
+ *   - Windows only, receive/sender threads: giving these two threads a
+ *     flat elevated OS thread priority (the initial approach) was found,
+ *     via live measurement, to intermittently starve unrelated processes
+ *     on the same machine under load (observed as the box's own RDP
+ *     session freezing) -- a blunt instrument. The worker pool was fixed
+ *     by simply dropping to low priority (see WorkerThread's vlc_clone()
+ *     call), since it has queue slack either way. But the receive/sender
+ *     threads genuinely do need reliable, low-latency scheduling, which
+ *     low priority would give up. The Windows-native answer for exactly
+ *     this tension is the Multimedia Class Scheduler Service (MMCSS,
+ *     Vista+): AvSetMmThreadCharacteristics() gives a thread short,
+ *     regular bursts of high priority (long enough to stay ahead of the
+ *     stream, short enough that non-multimedia work -- e.g. the same
+ *     RDP session -- isn't starved), which is exactly the mechanism
+ *     real Windows media applications (DirectShow/Media Foundation-based
+ *     capture and playback pipelines) use instead of a flat priority
+ *     bump. Both threads register with it ("Capture" / "Playback") and
+ *     run at ordinary base priority otherwise, letting MMCSS do the
+ *     boosting instead of vlc_clone()'s priority argument.
  *
  * Targets the VLC 3.0.x plugin ABI (mtime_t/date_t, not the VLC4 vlc_tick_t
  * API).
@@ -79,6 +98,7 @@
 # include <winsock2.h>
 # include <ws2tcpip.h>
 # include <mswsock.h>
+# include <avrt.h>
 # define poll(fds, nfds, timeout) WSAPoll((fds), (nfds), (timeout))
 
 /* The MinGW-w64 toolchain used to build this (mingw-w64-x86_64-gcc via
@@ -1188,6 +1208,19 @@ static void *ReceiveThread(void *data)
     demux_sys_t *p_sys = p_demux->p_sys;
     RIORESULT results[RIO_MAX_RESULTS];
 
+    /* MMCSS (see the file header comment for why this replaces a flat
+       elevated vlc_clone() priority): short, regular high-priority bursts
+       instead of a constant boost, so this thread stays ahead of the
+       wire without starving unrelated processes on the same machine.
+       Not fatal if it fails (e.g. the service isn't running) -- this
+       thread still works without it, just with the same starvation risk
+       a flat priority bump would have had. */
+    DWORD mmcss_task_index = 0;
+    HANDLE mmcss_handle = AvSetMmThreadCharacteristicsW(L"Capture", &mmcss_task_index);
+    if (!mmcss_handle)
+        msg_Warn(p_demux, "st2110: AvSetMmThreadCharacteristics(Capture) failed "
+                 "(err=%lu), receive thread running without MMCSS", GetLastError());
+
     /* Spin guard: if RIONotify()+WaitForSingleObject() ever reports the
        event signaled with genuinely nothing to dequeue, several times in
        a row, something is wrong with the notify/reset handshake (e.g. a
@@ -1266,6 +1299,8 @@ static void *ReceiveThread(void *data)
         }
     }
 
+    if (mmcss_handle)
+        AvRevertMmThreadCharacteristics(mmcss_handle);
     return NULL;
 }
 #else
@@ -1395,6 +1430,16 @@ static void *SenderThread(void *data)
        thread can't keep up" from "workers/decode can't keep up"). Zero
        means "no previous sample yet". */
     ULONGLONG recv_cpu_prev_100ns = 0;
+
+    /* MMCSS, same reasoning as ReceiveThread's (see the file header
+       comment): this thread must reliably keep pace with the frame
+       interval, but a flat elevated priority was found to starve
+       unrelated processes under load. Not fatal if it fails. */
+    DWORD mmcss_task_index = 0;
+    HANDLE mmcss_handle = AvSetMmThreadCharacteristicsW(L"Playback", &mmcss_task_index);
+    if (!mmcss_handle)
+        msg_Warn(p_demux, "st2110: AvSetMmThreadCharacteristics(Playback) failed "
+                 "(err=%lu), sender thread running without MMCSS", GetLastError());
 #endif
 
     for (;;) {
@@ -1544,6 +1589,10 @@ static void *SenderThread(void *data)
 #endif
     }
 
+#ifdef _WIN32
+    if (mmcss_handle)
+        AvRevertMmThreadCharacteristics(mmcss_handle);
+#endif
     return NULL;
 }
 
@@ -1756,7 +1805,16 @@ static int Open(vlc_object_t *obj)
     vlc_cond_init(&p_sys->frame_cond);
     p_sys->b_frame_cond_inited = true;
 
+    /* Windows: base priority stays low; ReceiveThread() registers itself
+       with MMCSS for the real-time boost instead (see the file header
+       comment for why that replaced a flat elevated priority here).
+       POSIX has no MMCSS equivalent, so it keeps the original elevated
+       priority. */
+#ifdef _WIN32
+    if (vlc_clone(&p_sys->receive_thread, ReceiveThread, p_demux, VLC_THREAD_PRIORITY_LOW)) {
+#else
     if (vlc_clone(&p_sys->receive_thread, ReceiveThread, p_demux, VLC_THREAD_PRIORITY_INPUT)) {
+#endif
         msg_Err(p_demux, "st2110: failed to spawn receive thread");
         goto error;
     }
@@ -1785,7 +1843,13 @@ static int Open(vlc_object_t *obj)
         p_sys->n_workers_started++;
     }
 
+    /* Same reasoning as receive_thread above: MMCSS on Windows, original
+       elevated priority on POSIX. */
+#ifdef _WIN32
+    if (vlc_clone(&p_sys->sender_thread, SenderThread, p_demux, VLC_THREAD_PRIORITY_LOW)) {
+#else
     if (vlc_clone(&p_sys->sender_thread, SenderThread, p_demux, VLC_THREAD_PRIORITY_OUTPUT)) {
+#endif
         msg_Err(p_demux, "st2110: failed to spawn sender thread");
         goto error;
     }

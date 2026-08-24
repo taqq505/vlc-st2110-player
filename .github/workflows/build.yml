@@ -73,12 +73,20 @@ jobs:
           # missing, but because ITS OWN dependency is. libvlccore.dll and
           # ws2_32.dll stay dynamic (they're provided by VLC/Windows
           # itself and always present).
+          # -lavrt: Multimedia Class Scheduler Service (MMCSS) client lib,
+          # for AvSetMmThreadCharacteristics()/AvRevertMmThreadCharacteristics()
+          # on the receive/sender threads (see the file header comment --
+          # this is the Windows-native mechanism real-time media apps use
+          # for reliable scheduling that does NOT starve the rest of the
+          # system, unlike a flat elevated thread priority). Avrt.dll ships
+          # with Windows itself (Vista+), so this adds no new runtime
+          # dependency beyond what's always present.
           gcc -std=gnu11 -Wall -Wextra -O2 -shared -DPIC -D__PLUGIN__ -DMODULE_STRING=\"st2110\" \
             -static-libgcc \
             -I vlc-src/include \
             -o receive-module/libst2110_plugin.dll \
             receive-module/st2110.c \
-            "$VLC_CORE_DLL" -lws2_32 \
+            "$VLC_CORE_DLL" -lws2_32 -lavrt \
             -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic
 
       - name: Package
