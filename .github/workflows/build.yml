@@ -64,11 +64,22 @@ jobs:
         run: |
           set -e
           VLC_CORE_DLL="/c/Program Files/VideoLAN/VLC/libvlccore.dll"
+          # -static-libgcc / static winpthread: without these, the DLL
+          # dynamically depends on MinGW runtime DLLs (libgcc_s_seh-1.dll,
+          # libwinpthread-1.dll) that only exist on a machine with
+          # MSYS2/MinGW installed. On a plain Windows box without that dev
+          # tooling, VLC fails to load the plugin with "error 126 (module
+          # not found)" -- not because libst2110_plugin.dll itself is
+          # missing, but because ITS OWN dependency is. libvlccore.dll and
+          # ws2_32.dll stay dynamic (they're provided by VLC/Windows
+          # itself and always present).
           gcc -std=gnu11 -Wall -Wextra -O2 -shared -DPIC -D__PLUGIN__ -DMODULE_STRING=\"st2110\" \
+            -static-libgcc \
             -I vlc-src/include \
             -o receive-module/libst2110_plugin.dll \
             receive-module/st2110.c \
-            "$VLC_CORE_DLL" -lws2_32
+            "$VLC_CORE_DLL" -lws2_32 \
+            -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic
 
       - name: Package
         run: |
