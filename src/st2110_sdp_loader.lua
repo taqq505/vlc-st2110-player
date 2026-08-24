@@ -15,7 +15,7 @@
 
 local USE_CUSTOM_VIDEO_DEFAULT = false   -- 仕様書 §5.3。チェックボックスの初期値。
 
-local dlg, vbox, abox, custom_video_check, status
+local dlg, vbox, abox, custom_video_check, threads_box, status
 
 local function trim(s)
   return s:match("^%s*(.-)%s*$")
@@ -212,10 +212,12 @@ function activate()
   custom_video_check = dlg:add_check_box(
     "Use custom 10bit receiver (st2110://, requires the C access_demux plugin)",
     USE_CUSTOM_VIDEO_DEFAULT, 1, 19, 4, 1)
-  dlg:add_button("Play", play, 1, 20, 1, 1)
-  dlg:add_button("Stop", stop, 2, 20, 1, 1)
-  dlg:add_button("Clear", clear, 3, 20, 1, 1)
-  status = dlg:add_label("", 1, 21, 4, 1)
+  dlg:add_label("Worker threads (0 = auto):", 1, 20, 2, 1)
+  threads_box = dlg:add_text_input("0", 3, 20, 2, 1)
+  dlg:add_button("Play", play, 1, 21, 1, 1)
+  dlg:add_button("Stop", stop, 2, 21, 1, 1)
+  dlg:add_button("Clear", clear, 3, 21, 1, 1)
+  status = dlg:add_label("", 1, 22, 4, 1)
   dlg:show()
 end
 
@@ -251,6 +253,16 @@ function play()
       end
       main_uri = mrl
       for _, o in ipairs(opts or {}) do table.insert(extra_opts, o) end
+
+      local threads_text = trim(threads_box:get_text())
+      local threads_n = tonumber(threads_text)
+      if threads_text ~= "" and (not threads_n or threads_n ~= math.floor(threads_n) or threads_n < 0) then
+        status:set_text("ワーカースレッド数は0以上の整数で指定してください")
+        return
+      end
+      if threads_n and threads_n > 0 then
+        table.insert(extra_opts, ":st2110-threads=" .. threads_n)
+      end
     else
       local p = write_sdp("st2110_video.sdp", v)
       if not p then
