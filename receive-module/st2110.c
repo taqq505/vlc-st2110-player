@@ -1142,6 +1142,15 @@ static void *SenderThread(void *data)
         if (p_block) {
             memcpy(p_block->p_buffer, p_sys->p_master_buf, p_sys->i_buf_size);
             p_block->i_dts = p_block->i_pts = date_Get(&p_sys->pts);
+            /* WriteLines() already weaves both fields into one frame (see
+               MapLine()), but without this flag VLC's own deinterlace
+               filter has no way to know that -- it can only guess from
+               the format, guesses wrong, and leaves the raw field comb
+               visible as horizontal striping. Top-field-first matches
+               virtually all real-world 1080i broadcast sources; RFC4175
+               itself carries no TFF/BFF signal to check against. */
+            if (p_sys->b_interlace)
+                p_block->i_flags |= BLOCK_FLAG_TOP_FIELD_FIRST;
             es_out_Control(p_demux->out, ES_OUT_SET_PCR, p_block->i_pts);
             es_out_Send(p_demux->out, p_sys->p_es, p_block);
         }
