@@ -1,8 +1,7 @@
 name: Build
 
-# Manual only: this project is developed on a machine without local build
-# tools, so builds are driven from here on demand rather than on every push.
 on:
+  push:
   workflow_dispatch:
 
 jobs:

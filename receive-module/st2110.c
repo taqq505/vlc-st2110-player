@@ -49,6 +49,21 @@
  *     driven by arrival timing at all) and periodically snapshots whatever
  *     is currently in the master buffer to es_out. Packet loss just means
  *     some pixels are one tick stale, not a discarded/blanked frame.
+ *   - Windows only: even a single dedicated receive thread using classic
+ *     WSARecv()/overlapped I/O topped out around ~138k pkts/sec on real
+ *     hardware (an Intel X520 test rig), well short of the wire rate, with
+ *     the shortfall showing up as NIC-level ReceivedDiscardedPackets no
+ *     NIC/driver tuning (RSS core, checksum offload, interrupt moderation)
+ *     could move. A parallel capture of the exact same stream via pktmon
+ *     (which taps packets at the NDIS level, below the normal socket
+ *     stack) saw almost no loss, pointing at ordinary per-packet
+ *     WSARecv()/AFD overhead -- not the NIC -- as the real ceiling. The
+ *     receive thread therefore uses Windows Registered I/O (RIO) instead:
+ *     a Winsock extension (Windows 8+, no external driver) built exactly
+ *     for this -- pre-registered buffers plus a completion queue avoid
+ *     most of that per-packet kernel-transition cost. Published RIO
+ *     benchmarks reach 180k-450k+ pkts/sec on a single socket, comfortably
+ *     past the wall this module was hitting.
  *
  * Targets the VLC 3.0.x plugin ABI (mtime_t/date_t, not the VLC4 vlc_tick_t
  * API).
@@ -56,13 +71,14 @@
 
 #ifdef _WIN32
 # ifndef _WIN32_WINNT
-#  define _WIN32_WINNT 0x0601
+#  define _WIN32_WINNT 0x0602  /* Windows 8+: required for Registered I/O (RIO) */
 # endif
 # ifndef WINVER
-#  define WINVER 0x0601
+#  define WINVER 0x0602
 # endif
 # include <winsock2.h>
 # include <ws2tcpip.h>
+# include <mswsock.h>
 # define poll(fds, nfds, timeout) WSAPoll((fds), (nfds), (timeout))
 #endif
 
@@ -110,10 +126,14 @@
  * receive thread ever having to block. */
 #define QUEUE_CAPACITY        4096
 
-/* Overlapped WSARecv() buffers the (single) Windows receive thread keeps
- * in flight at once, so it never has to wait for one recv() to complete
- * before starting the next. Must stay under MAXIMUM_WAIT_OBJECTS (64). */
-#define WIN_BUFS_PER_THREAD    16
+/* Registered I/O (RIO) receive buffer pool: the (single) Windows receive
+ * thread pre-posts this many receive buffers up front (see the file
+ * header comment for why RIO replaces classic WSARecv()/overlapped I/O
+ * here), so this many datagrams can be in flight without the driver ever
+ * having to wait on the application. */
+#define RIO_BUF_COUNT        4096
+#define RIO_CQ_SIZE           RIO_BUF_COUNT
+#define RIO_MAX_RESULTS        256   /* batch size when draining completions */
 
 /*
  * SMPTE ST 2110-20:2017 6.1.5 defines the SRD Line No as zero-based. In
@@ -141,17 +161,6 @@ typedef struct {
     uint16_t line_no;     /* raw 15-bit wire value                         */
     uint16_t offset;      /* raw 15-bit sample offset within the line      */
 } rfc4175_line_hdr_t;
-
-#ifdef _WIN32
-/* One overlapped WSARecv() buffer, owned by the (single) receive thread.
- * overlapped.hEvent is set once at creation and preserved across reposts. */
-typedef struct {
-    OVERLAPPED overlapped;
-    WSABUF     wsabuf;
-    DWORD      flags;
-    uint8_t    data[RECV_BUF_LEN];
-} win_recv_buf_t;
-#endif
 
 /* One slot in the shared staging queue: a raw, not-yet-parsed copy of one
  * received datagram. */
@@ -186,6 +195,21 @@ struct demux_sys_t
     char     psz_group[256];
     int      i_port;
     char    *psz_source;
+
+#ifdef _WIN32
+    /* Registered I/O (RIO) state: replaces classic WSARecv()/overlapped
+       I/O for the receive thread (see the file header comment for why).
+       The socket itself is created manually with WSA_FLAG_REGISTERED_IO
+       instead of via net_OpenDgram(), since RIO requires that flag at
+       socket-creation time. */
+    RIO_EXTENSION_FUNCTION_TABLE rio;
+    uint8_t      *p_rio_buf;      /* one big buffer, registered with RIO */
+    RIO_BUFFERID  rio_buf_id;
+    RIO_CQ        rio_cq;
+    RIO_RQ        rio_rq;
+    HANDLE        rio_event;
+    bool          b_rio_inited;
+#endif
 
     /* format */
     unsigned i_width;
@@ -624,80 +648,212 @@ static bool QueuePop(demux_sys_t *p_sys, uint8_t *out_data, size_t *out_len)
 }
 
 #ifdef _WIN32
+/* Retrieves the RIO extension function table for a RIO-capable socket
+ * (one created with WSA_FLAG_REGISTERED_IO). RIO isn't exposed as a
+ * normal linkable API -- it must be queried per-socket via WSAIoctl. */
+static bool GetRioFunctionTable(SOCKET s, RIO_EXTENSION_FUNCTION_TABLE *out)
+{
+    GUID rio_guid = WSAID_MULTIPLE_RIO;
+    DWORD bytes = 0;
+    int r = WSAIoctl(s, SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER,
+                      &rio_guid, sizeof(rio_guid),
+                      out, sizeof(*out), &bytes, NULL, NULL);
+    return r == 0;
+}
+
+/* Creates the RIO-capable receive socket and joins the multicast group,
+ * replacing net_OpenDgram() on Windows (see the file header comment for
+ * why): RIO requires the socket to be created with WSA_FLAG_REGISTERED_IO
+ * up front, which VLC's own net_OpenDgram() has no way to request. This
+ * duplicates net_OpenDgram()'s bind + (source-specific, if st2110-source
+ * is set) multicast join, IPv4 only. */
+static int OpenRioSocket(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    struct in_addr group_addr, source_addr;
+    if (InetPtonA(AF_INET, p_sys->psz_group, &group_addr) != 1) {
+        msg_Err(p_demux, "st2110: invalid group address \"%s\"", p_sys->psz_group);
+        return VLC_EGENERIC;
+    }
+    bool b_ssm = p_sys->psz_source && *p_sys->psz_source;
+    if (b_ssm && InetPtonA(AF_INET, p_sys->psz_source, &source_addr) != 1) {
+        msg_Err(p_demux, "st2110: invalid source address \"%s\"", p_sys->psz_source);
+        return VLC_EGENERIC;
+    }
+
+    SOCKET s = WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, 0,
+                           WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO);
+    if (s == INVALID_SOCKET) {
+        msg_Err(p_demux, "st2110: WSASocket failed (err=%d)", WSAGetLastError());
+        return VLC_EGENERIC;
+    }
+
+    BOOL reuse = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
+    int rcvbuf = SO_RCVBUF_SIZE;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons((u_short)p_sys->i_port);
+    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        msg_Err(p_demux, "st2110: bind failed (err=%d)", WSAGetLastError());
+        closesocket(s);
+        return VLC_EGENERIC;
+    }
+
+    if (b_ssm) {
+        struct ip_mreq_source mreq;
+        memset(&mreq, 0, sizeof(mreq));
+        mreq.imr_multiaddr = group_addr;
+        mreq.imr_sourceaddr = source_addr;
+        mreq.imr_interface.s_addr = INADDR_ANY;
+        if (setsockopt(s, IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP,
+                        (const char *)&mreq, sizeof(mreq)) == SOCKET_ERROR) {
+            msg_Err(p_demux, "st2110: IP_ADD_SOURCE_MEMBERSHIP failed (err=%d)", WSAGetLastError());
+            closesocket(s);
+            return VLC_EGENERIC;
+        }
+    } else {
+        struct ip_mreq mreq;
+        memset(&mreq, 0, sizeof(mreq));
+        mreq.imr_multiaddr = group_addr;
+        mreq.imr_interface.s_addr = INADDR_ANY;
+        if (setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                        (const char *)&mreq, sizeof(mreq)) == SOCKET_ERROR) {
+            msg_Err(p_demux, "st2110: IP_ADD_MEMBERSHIP failed (err=%d)", WSAGetLastError());
+            closesocket(s);
+            return VLC_EGENERIC;
+        }
+    }
+
+    if (!GetRioFunctionTable(s, &p_sys->rio)) {
+        msg_Err(p_demux, "st2110: failed to get RIO function table (err=%d)", WSAGetLastError());
+        closesocket(s);
+        return VLC_EGENERIC;
+    }
+
+    size_t total_size = (size_t)RIO_BUF_COUNT * RECV_BUF_LEN;
+    p_sys->p_rio_buf = VirtualAlloc(NULL, total_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!p_sys->p_rio_buf) {
+        msg_Err(p_demux, "st2110: VirtualAlloc failed for RIO buffer");
+        closesocket(s);
+        return VLC_EGENERIC;
+    }
+
+    p_sys->rio_buf_id = p_sys->rio.RIORegisterBuffer((PCHAR)p_sys->p_rio_buf, (DWORD)total_size);
+    if (p_sys->rio_buf_id == RIO_INVALID_BUFFERID) {
+        msg_Err(p_demux, "st2110: RIORegisterBuffer failed (err=%d)", WSAGetLastError());
+        closesocket(s);
+        return VLC_EGENERIC;
+    }
+
+    p_sys->rio_event = CreateEvent(NULL, TRUE /* manual reset */, FALSE, NULL);
+    if (!p_sys->rio_event) {
+        msg_Err(p_demux, "st2110: CreateEvent failed for RIO");
+        closesocket(s);
+        return VLC_EGENERIC;
+    }
+
+    RIO_NOTIFICATION_COMPLETION notify;
+    memset(&notify, 0, sizeof(notify));
+    notify.Type = RIO_EVENT_COMPLETION;
+    notify.Event.EventHandle = p_sys->rio_event;
+    notify.Event.NotifyReset = TRUE;
+
+    p_sys->rio_cq = p_sys->rio.RIOCreateCompletionQueue(RIO_CQ_SIZE, &notify);
+    if (p_sys->rio_cq == RIO_CORRUPT_CQ) {
+        msg_Err(p_demux, "st2110: RIOCreateCompletionQueue failed (err=%d)", WSAGetLastError());
+        closesocket(s);
+        return VLC_EGENERIC;
+    }
+
+    p_sys->rio_rq = p_sys->rio.RIOCreateRequestQueue(s, RIO_BUF_COUNT, 1, 0, 1,
+                                                       p_sys->rio_cq, p_sys->rio_cq, NULL);
+    if (p_sys->rio_rq == RIO_INVALID_RQ) {
+        msg_Err(p_demux, "st2110: RIOCreateRequestQueue failed (err=%d)", WSAGetLastError());
+        closesocket(s);
+        return VLC_EGENERIC;
+    }
+
+    for (ULONG i = 0; i < RIO_BUF_COUNT; i++) {
+        RIO_BUF buf;
+        buf.BufferId = p_sys->rio_buf_id;
+        buf.Offset = i * RECV_BUF_LEN;
+        buf.Length = RECV_BUF_LEN;
+        if (!p_sys->rio.RIOReceive(p_sys->rio_rq, &buf, 1, 0, (PVOID)(uintptr_t)i))
+            msg_Warn(p_demux, "st2110: RIOReceive failed to post buffer %lu (err=%d)", i, WSAGetLastError());
+    }
+
+    p_sys->fd = (int)s;
+    p_sys->b_rio_inited = true;
+    return VLC_SUCCESS;
+}
+
 /* Windows receive thread: exactly one of these ever exists (see the file
- * header comment for why multiple threads sharing one socket is an
- * anti-pattern rather than a parallelism win). It keeps WIN_BUFS_PER_THREAD
- * overlapped WSARecv() buffers/events in flight so it never waits for one
- * recv() to complete before starting the next, and its only job on
- * completion is to copy the datagram into the staging queue and repost --
- * no parsing happens on this thread.
+ * header comment). Uses Registered I/O (RIO) instead of classic
+ * WSARecv()/overlapped I/O -- all RIO_BUF_COUNT receive buffers were
+ * pre-posted once by OpenRioSocket() before this thread started; this
+ * loop only waits for completions, copies each completed datagram into
+ * the staging queue, and reposts that same buffer slot immediately. No
+ * parsing happens on this thread.
  *
- * The wait is bounded (1000ms) and, on cancellation, Close() also calls
- * CancelIoEx() once, so this thread wakes promptly on shutdown rather than
- * waiting out the full timeout. */
+ * The wait is bounded (1000ms), so this thread also notices
+ * b_stop_requested promptly on shutdown without needing anything like the
+ * old CancelIoEx() call. */
 static void *ReceiveThread(void *data)
 {
     demux_t *p_demux = data;
     demux_sys_t *p_sys = p_demux->p_sys;
-
-    win_recv_buf_t *bufs = calloc(WIN_BUFS_PER_THREAD, sizeof(win_recv_buf_t));
-    HANDLE events[WIN_BUFS_PER_THREAD];
-    if (!bufs) {
-        msg_Err(p_demux, "st2110: receive thread failed to allocate buffers");
-        return NULL;
-    }
-
-    for (unsigned i = 0; i < WIN_BUFS_PER_THREAD; i++) {
-        events[i] = CreateEvent(NULL, FALSE /* auto-reset */, FALSE, NULL);
-        bufs[i].overlapped.hEvent = events[i];
-        bufs[i].wsabuf.buf = (char *)bufs[i].data;
-        bufs[i].wsabuf.len = RECV_BUF_LEN;
-        int r = WSARecv((SOCKET)p_sys->fd, &bufs[i].wsabuf, 1, NULL, &bufs[i].flags,
-                         &bufs[i].overlapped, NULL);
-        if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
-            msg_Warn(p_demux, "st2110: WSARecv failed to post buffer %u (err=%d)", i, WSAGetLastError());
-    }
+    RIORESULT results[RIO_MAX_RESULTS];
 
     for (;;) {
         if (atomic_load(&p_sys->b_stop_requested))
             break;
 
-        DWORD w = WaitForMultipleObjects(WIN_BUFS_PER_THREAD, events, FALSE, 1000);
+        p_sys->rio.RIONotify(p_sys->rio_cq);
+
+        DWORD w = WaitForSingleObject(p_sys->rio_event, 1000);
         if (w == WAIT_TIMEOUT)
             continue;
-        if (w < WAIT_OBJECT_0 || w >= WAIT_OBJECT_0 + WIN_BUFS_PER_THREAD)
+        if (w != WAIT_OBJECT_0)
             break; /* WAIT_FAILED or abandoned: nothing more we can do here */
 
-        unsigned i = w - WAIT_OBJECT_0;
         int canc = vlc_savecancel();
 
-        DWORD xfer = 0, flags = 0;
-        BOOL ok = WSAGetOverlappedResult((SOCKET)p_sys->fd, &bufs[i].overlapped, &xfer, FALSE, &flags);
-        if (ok && xfer > 0) {
-            atomic_fetch_add(&p_sys->i_pkts_total, 1);
-            QueuePush(p_sys, bufs[i].data, (size_t)xfer);
-        }
+        for (;;) {
+            ULONG n = p_sys->rio.RIODequeueCompletion(p_sys->rio_cq, results, RIO_MAX_RESULTS);
+            if (n == 0 || n == RIO_CORRUPT_CQ)
+                break;
 
-        if (!atomic_load(&p_sys->b_stop_requested)) {
-            bufs[i].wsabuf.buf = (char *)bufs[i].data;
-            bufs[i].wsabuf.len = RECV_BUF_LEN;
-            bufs[i].flags = 0;
-            bufs[i].overlapped.Internal = 0;
-            bufs[i].overlapped.InternalHigh = 0;
-            bufs[i].overlapped.Offset = 0;
-            bufs[i].overlapped.OffsetHigh = 0;
-            int r = WSARecv((SOCKET)p_sys->fd, &bufs[i].wsabuf, 1, NULL, &bufs[i].flags,
-                             &bufs[i].overlapped, NULL);
-            if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
-                msg_Warn(p_demux, "st2110: WSARecv repost failed (err=%d)", WSAGetLastError());
+            for (ULONG i = 0; i < n; i++) {
+                ULONG slot = (ULONG)(uintptr_t)results[i].RequestContext;
+
+                if (results[i].BytesTransferred > 0) {
+                    atomic_fetch_add(&p_sys->i_pkts_total, 1);
+                    QueuePush(p_sys, p_sys->p_rio_buf + (size_t)slot * RECV_BUF_LEN,
+                              results[i].BytesTransferred);
+                }
+
+                if (!atomic_load(&p_sys->b_stop_requested)) {
+                    RIO_BUF buf;
+                    buf.BufferId = p_sys->rio_buf_id;
+                    buf.Offset = slot * RECV_BUF_LEN;
+                    buf.Length = RECV_BUF_LEN;
+                    p_sys->rio.RIOReceive(p_sys->rio_rq, &buf, 1, 0, (PVOID)(uintptr_t)slot);
+                }
+            }
+
+            if (n < RIO_MAX_RESULTS)
+                break;
         }
 
         vlc_restorecancel(canc);
     }
 
-    for (unsigned i = 0; i < WIN_BUFS_PER_THREAD; i++)
-        CloseHandle(events[i]);
-    free(bufs);
     return NULL;
 }
 #else
@@ -937,6 +1093,14 @@ static int Open(vlc_object_t *obj)
         p_sys->n_threads = n_cpu > 2 ? n_cpu - 2 : 1;
     }
 
+#ifdef _WIN32
+    /* Not net_OpenDgram(): the receive socket must be created with
+       WSA_FLAG_REGISTERED_IO up front for RIO (see OpenRioSocket() and
+       the file header comment for why). This also does the bind and
+       multicast join, and sets SO_RCVBUF itself. */
+    if (OpenRioSocket(p_demux) != VLC_SUCCESS)
+        goto error;
+#else
     p_sys->fd = net_OpenDgram(p_demux, p_sys->psz_group, p_sys->i_port,
                                p_sys->psz_source, 0, IPPROTO_UDP);
     if (p_sys->fd == -1) {
@@ -945,13 +1109,6 @@ static int Open(vlc_object_t *obj)
     }
     int rcvbuf = SO_RCVBUF_SIZE;
     setsockopt(p_sys->fd, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
-
-#ifdef _WIN32
-    /* No shared IOCP/buffer setup here: the (single) receive thread
-       creates and owns its own overlapped recv buffers (see
-       ReceiveThread), since the socket itself is overlapped-capable by
-       default without any association. */
-#else
     { int flags = fcntl(p_sys->fd, F_GETFL, 0); fcntl(p_sys->fd, F_SETFL, flags | O_NONBLOCK); }
 #endif
 
@@ -1049,19 +1206,27 @@ static void Close(vlc_object_t *obj)
         vlc_join(p_sys->sender_thread, NULL);
     }
 
-#ifdef _WIN32
-    /* Cancels the receive thread's outstanding WSARecv()s (CancelIoEx,
-       unlike the older CancelIo, cancels operations for this handle
-       regardless of which thread issued them), so it wakes immediately
-       instead of waiting out its own 1000ms timeout. */
-    if (p_sys->fd != -1)
-        CancelIoEx((HANDLE)(uintptr_t)(SOCKET)p_sys->fd, NULL);
-#endif
-
     if (p_sys->b_receive_started) {
         vlc_cancel(p_sys->receive_thread);
         vlc_join(p_sys->receive_thread, NULL);
     }
+
+#ifdef _WIN32
+    /* Must happen after the receive thread has stopped (it's the only
+       thing still touching rio_cq/rio_rq), and before the socket itself
+       is closed below via net_Close(). RIO_RQ has no separate close call
+       -- it's torn down implicitly when the socket closes. */
+    if (p_sys->b_rio_inited) {
+        if (p_sys->rio_buf_id != RIO_INVALID_BUFFERID)
+            p_sys->rio.RIODeregisterBuffer(p_sys->rio_buf_id);
+        if (p_sys->rio_cq != RIO_CORRUPT_CQ)
+            p_sys->rio.RIOCloseCompletionQueue(p_sys->rio_cq);
+        if (p_sys->rio_event)
+            CloseHandle(p_sys->rio_event);
+        if (p_sys->p_rio_buf)
+            VirtualFree(p_sys->p_rio_buf, 0, MEM_RELEASE);
+    }
+#endif
 
     /* Worker threads drain whatever is still queued, then notice
        b_stop_requested inside QueuePop (bounded to at most a 500ms wait
