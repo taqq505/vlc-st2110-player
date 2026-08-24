@@ -398,6 +398,11 @@ struct demux_sys_t
     bool         b_frame_lock_inited;
     bool         b_frame_cond_inited;
     bool         b_frame_ready;   /* protected by frame_lock */
+    /* Diagnostic: how many times SignalFrameComplete() actually fired,
+       so the marker-bit assumption above can be checked against reality
+       instead of just trusted -- read/reset by the sender thread every
+       ~5s, alongside its other stats. */
+    atomic_uint  i_frame_signals;
 
     /* Cooperative shutdown signal: a blocked WaitForMultipleObjects()/
        poll()/vlc_cond_timedwait() is not guaranteed to be interrupted by
@@ -685,6 +690,7 @@ static void WriteLines(demux_sys_t *p_sys, worker_stats_t *stats,
  * only one thread it could possibly wake. */
 static void SignalFrameComplete(demux_sys_t *p_sys)
 {
+    atomic_fetch_add(&p_sys->i_frame_signals, 1);
     vlc_mutex_lock(&p_sys->frame_lock);
     p_sys->b_frame_ready = true;
     vlc_mutex_unlock(&p_sys->frame_lock);
@@ -1204,6 +1210,7 @@ static void *SenderThread(void *data)
         if (mdate() - stat_window_start > 5 * CLOCK_FREQ) {
             unsigned pkts    = atomic_exchange(&p_sys->i_pkts_total, 0);
             unsigned dropped = atomic_exchange(&p_sys->i_pkts_dropped_queue_full, 0);
+            unsigned signals = atomic_exchange(&p_sys->i_frame_signals, 0);
 
             unsigned rtp_fail = 0, line_fail = 0, hdrs = 0, hdrs_f2 = 0;
             for (unsigned i = 0; i < p_sys->n_threads; i++) {
@@ -1219,6 +1226,15 @@ static void *SenderThread(void *data)
             if (p_sys->b_interlace)
                 msg_Warn(p_demux, "st2110: line headers total=%u field2=%u (%.1f%%)",
                          hdrs, hdrs_f2, hdrs ? 100.0 * hdrs_f2 / hdrs : 0.0);
+            /* Sanity check for the RTP-marker-bit assumption SenderThread
+               now relies on: over 5s, this should land close to
+               5*(fps_num/fps_den) -- e.g. ~150 for 29.97fps. Near 0 means
+               this sender never sets the marker bit, and the sender
+               thread is silently running on its bounded fallback timeout
+               the whole time instead of the real frame boundary. */
+            msg_Warn(p_demux, "st2110: frame_signals=%u (expected ~%.0f/5s if the "
+                     "sender sets the RTP marker bit)",
+                     signals, 5.0 * p_sys->i_fps_num / p_sys->i_fps_den);
 
             stat_window_start = mdate();
         }
