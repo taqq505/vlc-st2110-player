@@ -1390,14 +1390,12 @@ static void *SenderThread(void *data)
         }
         date_Increment(&p_sys->pts, 1);
 
-#if 0   /* TEMPORARILY DISABLED: user asked for a "pure" build with no
-           diagnostic logging, to check whether it's a factor in a
-           reported gradual slowdown (possibly VLC's own message
-           console accumulating text over a long session, not this
-           module's own processing cost -- the atomic_exchange() calls
-           below are cheap regardless of whether their results get
-           logged). Re-enable by flipping this to `#if 1` once that's
-           been isolated. */
+#if 1   /* Periodic (~5s) diagnostic log. Was temporarily disabled while
+           the module wasn't loading at all (a MinGW runtime dependency
+           issue, unrelated to logging) to test whether logging itself
+           was behind a reported gradual slowdown; re-enabled now that
+           that test never got a fair run and seq_lost needs to be
+           watched with the reorder-tolerant fix in place. */
         if (mdate() - stat_window_start > 5 * CLOCK_FREQ) {
             unsigned pkts     = atomic_exchange(&p_sys->i_pkts_total, 0);
             unsigned dropped  = atomic_exchange(&p_sys->i_pkts_dropped_queue_full, 0);
@@ -1453,8 +1451,6 @@ static void *SenderThread(void *data)
 
             stat_window_start = mdate();
         }
-#else
-        (void)stat_window_start;
 #endif
     }
 
