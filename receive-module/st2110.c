@@ -216,17 +216,27 @@ static const GUID st2110_WSAID_MULTIPLE_RIO = {
 #define SO_RCVBUF_SIZE (32 * 1024 * 1024)
 
 /* Depth of the staging queue between the one receive thread and the N
- * worker threads, in packets. At ~1400 bytes/packet this is ~16MB of
+ * worker threads, in packets. At ~1400 bytes/packet this is ~128MB of
  * buffering -- generous headroom against short worker stalls without the
- * receive thread ever having to block. */
-#define QUEUE_CAPACITY        4096
+ * receive thread ever having to block. Was 4096 (~16MB); raised after
+ * measurement showed real, confirmed packet loss (TrackSequenceLoss())
+ * persisting even with the receive/worker pipeline healthy, to rule out
+ * this queue itself as a contributor (i_queue_count_max in the periodic
+ * log shows how close it ever actually gets to this cap). */
+#define QUEUE_CAPACITY       32768
 
 /* Registered I/O (RIO) receive buffer pool: the (single) Windows receive
  * thread pre-posts this many receive buffers up front (see the file
  * header comment for why RIO replaces classic WSARecv()/overlapped I/O
  * here), so this many datagrams can be in flight without the driver ever
- * having to wait on the application. */
-#define RIO_BUF_COUNT        4096
+ * having to wait on the application. Was 4096, which at this stream's
+ * observed ~94k pkts/sec is only ~43ms of headroom before the whole pool
+ * is stuck "in flight" and RIO has nowhere to land new data -- a real,
+ * fixable capacity limit in this module's own code, not a wire/hardware
+ * ceiling. Raised to give a much larger margin; i_rio_completions/
+ * i_rio_full_batches in the periodic log show whether the receive thread
+ * is ever actually falling behind draining this. */
+#define RIO_BUF_COUNT       16384
 #define RIO_CQ_SIZE           RIO_BUF_COUNT
 #define RIO_MAX_RESULTS        256   /* batch size when draining completions */
 
@@ -388,6 +398,25 @@ struct demux_sys_t
     bool          b_queue_cond_inited;
 #endif
     atomic_uint   i_pkts_dropped_queue_full;
+    /* Peak i_queue_count ever observed, i.e. how close the staging queue
+       has come to QUEUE_CAPACITY -- a near-zero-relative-to-capacity
+       value here rules this queue out as a source of the packet loss
+       TrackSequenceLoss() measures; a value pinned near capacity would
+       point straight at it. Written only by the receive thread (single
+       producer, so no read-modify-write race), read/reset by the sender
+       thread every ~5s like the other counters. */
+    atomic_uint   i_queue_count_max;
+
+#ifdef _WIN32
+    /* RIO-specific drain diagnostics: total completions dequeued, and how
+       many drain iterations came back with a full RIO_MAX_RESULTS batch
+       (meaning there was still more waiting right then -- a sign the
+       receive thread is falling behind, not that it's idle). Both
+       written only by the receive thread, read/reset by the sender
+       thread every ~5s. */
+    atomic_uint   i_rio_completions;
+    atomic_uint   i_rio_full_batches;
+#endif
 
     /* Worker threads: N of these pop raw packets off p_queue and run the
        full parse -> unpack -> write pipeline in parallel. */
@@ -911,6 +940,8 @@ static void QueuePush(demux_sys_t *p_sys, const uint8_t *data, size_t len)
     slot->len = len;
     p_sys->i_queue_tail = (p_sys->i_queue_tail + 1) % p_sys->i_queue_cap;
     p_sys->i_queue_count++;
+    if (p_sys->i_queue_count > atomic_load_explicit(&p_sys->i_queue_count_max, memory_order_relaxed))
+        atomic_store_explicit(&p_sys->i_queue_count_max, p_sys->i_queue_count, memory_order_relaxed);
     vlc_mutex_unlock(&p_sys->queue_lock);
 
 #ifdef _WIN32
@@ -1188,6 +1219,7 @@ static void *ReceiveThread(void *data)
             if (n == 0 || n == RIO_CORRUPT_CQ)
                 break;
             n_total += n;
+            atomic_fetch_add(&p_sys->i_rio_completions, n);
 
             for (ULONG i = 0; i < n; i++) {
                 ULONG slot = (ULONG)(uintptr_t)results[i].RequestContext;
@@ -1211,6 +1243,13 @@ static void *ReceiveThread(void *data)
 
             if (n < RIO_MAX_RESULTS)
                 break;
+            /* Came back with a full batch: there was still more waiting
+               in the completion queue right then. Occasional full
+               batches are normal (that's what batching is for); if this
+               climbs high relative to i_rio_completions/RIO_MAX_RESULTS
+               in the periodic log, the receive thread is falling behind
+               the wire, not just draining bursts. */
+            atomic_fetch_add(&p_sys->i_rio_full_batches, 1);
         }
 
         vlc_restorecancel(canc);
@@ -1349,6 +1388,14 @@ static void *SenderThread(void *data)
     demux_sys_t *p_sys = p_demux->p_sys;
     mtime_t frame_interval = (mtime_t)CLOCK_FREQ * p_sys->i_fps_den / p_sys->i_fps_num;
     mtime_t stat_window_start = mdate();
+#ifdef _WIN32
+    /* Previous sample of the receive thread's own (kernel+user) CPU time,
+       in 100ns units, for computing its CPU% over each ~5s window below
+       -- see the periodic log block for why (distinguishing "receive
+       thread can't keep up" from "workers/decode can't keep up"). Zero
+       means "no previous sample yet". */
+    ULONGLONG recv_cpu_prev_100ns = 0;
+#endif
 
     for (;;) {
         if (atomic_load(&p_sys->b_stop_requested))
@@ -1397,10 +1444,12 @@ static void *SenderThread(void *data)
            that test never got a fair run and seq_lost needs to be
            watched with the reorder-tolerant fix in place. */
         if (mdate() - stat_window_start > 5 * CLOCK_FREQ) {
+            mtime_t window_us = mdate() - stat_window_start;
             unsigned pkts     = atomic_exchange(&p_sys->i_pkts_total, 0);
             unsigned dropped  = atomic_exchange(&p_sys->i_pkts_dropped_queue_full, 0);
             unsigned signals  = atomic_exchange(&p_sys->i_frame_signals, 0);
             unsigned seq_lost = atomic_exchange(&p_sys->i_pkts_seq_lost, 0);
+            unsigned queue_max = atomic_exchange(&p_sys->i_queue_count_max, 0);
 
             unsigned rtp_fail = 0, line_fail = 0, hdrs = 0, hdrs_f2 = 0;
             unsigned bad_geo = 0, out_of_range = 0;
@@ -1416,6 +1465,47 @@ static void *SenderThread(void *data)
 
             msg_Warn(p_demux, "st2110: pkts=%u dropped=%u rtp_fail=%u line_fail=%u",
                      pkts, dropped, rtp_fail, line_fail);
+            /* Staging queue backlog: how close QueuePush() ever actually
+               got to QUEUE_CAPACITY this window. Near-zero relative to
+               capacity rules this queue out as a source of seq_lost;
+               pinned near capacity would point straight at it. */
+            msg_Warn(p_demux, "st2110: queue_occupancy_max=%u/%u",
+                     queue_max, p_sys->i_queue_cap);
+#ifdef _WIN32
+            {
+                unsigned rio_completions = atomic_exchange(&p_sys->i_rio_completions, 0);
+                unsigned rio_full_batches = atomic_exchange(&p_sys->i_rio_full_batches, 0);
+                /* full_batches close to completions/RIO_MAX_RESULTS means
+                   the receive thread is chronically behind the wire, not
+                   just absorbing the occasional burst -- distinguishes
+                   "RIO's own buffer pool is the bottleneck" from "it's
+                   keeping up fine". */
+                msg_Warn(p_demux, "st2110: rio_completions=%u rio_full_batches=%u",
+                         rio_completions, rio_full_batches);
+
+                FILETIME ft_create, ft_exit, ft_kernel, ft_user;
+                if (GetThreadTimes((HANDLE)p_sys->receive_thread,
+                                    &ft_create, &ft_exit, &ft_kernel, &ft_user)) {
+                    ULARGE_INTEGER k, u;
+                    k.LowPart = ft_kernel.dwLowDateTime;
+                    k.HighPart = ft_kernel.dwHighDateTime;
+                    u.LowPart = ft_user.dwLowDateTime;
+                    u.HighPart = ft_user.dwHighDateTime;
+                    ULONGLONG cur_100ns = k.QuadPart + u.QuadPart;
+                    /* Receive thread's own CPU% over this window --
+                       distinguishes "RIO -> QueuePush can't keep up"
+                       (this pegged) from "RFC4175 unpack can't keep up"
+                       (workers pegged instead, this near-idle). Skipped
+                       on the very first window (no previous sample). */
+                    if (recv_cpu_prev_100ns != 0 && window_us > 0) {
+                        double delta_us = (double)(cur_100ns - recv_cpu_prev_100ns) / 10.0;
+                        double pct = delta_us / (double)window_us * 100.0;
+                        msg_Warn(p_demux, "st2110: receive_thread_cpu=%.1f%%", pct);
+                    }
+                    recv_cpu_prev_100ns = cur_100ns;
+                }
+            }
+#endif
             /* Confirmed wire-level loss (see TrackSequenceLoss()) --
                distinct from `dropped` above (our own queue backpressure)
                and from rtp_fail/line_fail (packets that arrived but
