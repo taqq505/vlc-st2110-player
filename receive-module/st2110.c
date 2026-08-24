@@ -383,9 +383,21 @@ struct demux_sys_t
     worker_stats_t *p_worker_stats;
     unsigned        n_workers_started;
 
-    /* sender thread: independent clock, decoupled from arrival timing */
+    /* sender thread: paced by SignalFrameComplete() below, not an
+       independent clock (see SenderThread() for why) */
     vlc_thread_t sender_thread;
     bool         b_sender_started;
+
+    /* Frame-complete signal from whichever worker processes the packet
+       carrying RFC4175's "last packet of this field/frame" marker bit
+       (see SignalFrameComplete()/ProcessPacket()). Only ever one waiter
+       (the sender thread), so this plain condvar is not subject to the
+       "wakes every waiter" issue documented on queue_sem above. */
+    vlc_mutex_t  frame_lock;
+    vlc_cond_t   frame_cond;
+    bool         b_frame_lock_inited;
+    bool         b_frame_cond_inited;
+    bool         b_frame_ready;   /* protected by frame_lock */
 
     /* Cooperative shutdown signal: a blocked WaitForMultipleObjects()/
        poll()/vlc_cond_timedwait() is not guaranteed to be interrupted by
@@ -484,13 +496,18 @@ static void SetColorimetry(video_format_t *v, const char *psz_colorimetry)
 }
 
 /* Parses the fixed 12-byte RTP header (plus CSRC list / extension header if
- * present) and returns the byte offset where the RTP payload begins. */
-static int ParseRTP(const uint8_t *p, size_t len, unsigned *hdr_len)
+ * present) and returns the byte offset where the RTP payload begins, plus
+ * the marker bit (RFC4175: set on the last packet of each field's, or for
+ * progressive the frame's, transmission -- used to know when a complete,
+ * non-torn frame has just landed in the master buffer). */
+static int ParseRTP(const uint8_t *p, size_t len, unsigned *hdr_len, bool *out_marker)
 {
     if (len < RTP_HDR_MIN_LEN)
         return -1;
     if ((p[0] >> 6) != 2)          /* RTP version must be 2 */
         return -1;
+
+    *out_marker = (p[1] & 0x80) != 0;
 
     unsigned cc = p[0] & 0x0f;
     bool ext = (p[0] & 0x10) != 0;
@@ -660,16 +677,34 @@ static void WriteLines(demux_sys_t *p_sys, worker_stats_t *stats,
     }
 }
 
+/* Wakes the sender thread (see SenderThread()) to tell it a complete,
+ * non-torn frame just finished landing in the master buffer. There is
+ * only ever one waiter (the sender thread), so -- unlike QueuePush's
+ * situation with many worker threads (see the file header comment) --
+ * a plain vlc_cond_signal() here can't cause a thundering herd: there's
+ * only one thread it could possibly wake. */
+static void SignalFrameComplete(demux_sys_t *p_sys)
+{
+    vlc_mutex_lock(&p_sys->frame_lock);
+    p_sys->b_frame_ready = true;
+    vlc_mutex_unlock(&p_sys->frame_lock);
+    vlc_cond_signal(&p_sys->frame_cond);
+}
+
 /* Parses one packet and writes its pixels straight into the master buffer.
  * Called by a worker thread with its own per-worker stats slot (see the
  * file header comment for why these are per-worker, not shared). No
- * frame/field bookkeeping of any kind: each packet is fully self-describing
- * (see file header). */
+ * frame/field bookkeeping is needed for CORRECT PLACEMENT of pixels --
+ * each packet is fully self-describing (see file header) -- but the RTP
+ * marker bit is still tracked for a different reason: knowing when a
+ * complete frame is ready to be *sent*, so the sender thread doesn't have
+ * to guess via an independent clock (see SenderThread()). */
 static void ProcessPacket(demux_sys_t *p_sys, worker_stats_t *stats,
                            const uint8_t *pkt, size_t len)
 {
     unsigned hdr_len;
-    if (ParseRTP(pkt, len, &hdr_len) != 0) {
+    bool marker;
+    if (ParseRTP(pkt, len, &hdr_len, &marker) != 0) {
         atomic_fetch_add(&stats->pkts_rtp_fail, 1);
         return;
     }
@@ -694,6 +729,13 @@ static void ProcessPacket(demux_sys_t *p_sys, worker_stats_t *stats,
 
     DetectLineMode(p_sys, hdrs, n_hdrs);
     WriteLines(p_sys, stats, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
+
+    /* For interlace, only field two's marker completes a full woven
+       frame -- field one's marker just means "half done, field two still
+       to come". hdrs[0] stands in for the whole packet's field since a
+       single packet's chained SRD headers are always for one field. */
+    if (marker && (!p_sys->b_interlace || hdrs[0].field2))
+        SignalFrameComplete(p_sys);
 }
 
 /* Pushes a raw, not-yet-parsed datagram into the shared staging queue.
@@ -1108,12 +1150,18 @@ static void *WorkerThread(void *data)
     return NULL;
 }
 
-/* Independent sender thread: ticks on its own clock at the stream's
- * declared frame rate, completely decoupled from arrival timing. Each
- * tick just snapshots whatever is currently in the master buffer and
- * sends it -- packet loss just means some pixels are one tick stale,
- * never a discarded or blanked frame. Also owns the periodic (~5s)
- * diagnostic log, since it already wakes on a steady schedule. */
+/* Sender thread: paced by whichever worker calls SignalFrameComplete()
+ * (see ProcessPacket()) when a complete, non-torn frame just finished
+ * landing in the master buffer, rather than ticking on an independent
+ * clock. The earlier independent-clock design had no idea whether a
+ * write was mid-flight when it snapshotted, so it could (and, per a
+ * visible horizontal-tearing artifact, did) grab a frame that was half
+ * this field and half the previous one. Waiting for the real field/frame
+ * boundary instead eliminates that at the source. The wait is still
+ * bounded (2 frame intervals) as a fallback for a stalled/lost stream,
+ * so a missed marker can't wedge this thread -- packet loss still just
+ * means some pixels are one tick stale, never a discarded or blanked
+ * frame. Also owns the periodic (~5s) diagnostic log. */
 static void *SenderThread(void *data)
 {
     demux_t *p_demux = data;
@@ -1125,15 +1173,12 @@ static void *SenderThread(void *data)
         if (atomic_load(&p_sys->b_stop_requested))
             break;
 
-        /* A plain relative sleep, not "wait until an absolute deadline":
-           the latter can degenerate into a busy spin (zero actual wait)
-           if any single iteration -- e.g. es_out_Send() blocking on a
-           congested decoder fifo -- ever takes longer than one frame
-           interval, since the next deadline would already be in the past
-           by the time it's computed. A relative sleep always waits at
-           least close to frame_interval no matter how the previous
-           iteration went. */
-        msleep(frame_interval);
+        vlc_mutex_lock(&p_sys->frame_lock);
+        if (!p_sys->b_frame_ready)
+            vlc_cond_timedwait(&p_sys->frame_cond, &p_sys->frame_lock,
+                                mdate() + frame_interval * 2);
+        p_sys->b_frame_ready = false;
+        vlc_mutex_unlock(&p_sys->frame_lock);
 
         if (atomic_load(&p_sys->b_stop_requested))
             break;
@@ -1356,6 +1401,13 @@ static int Open(vlc_object_t *obj)
     if (!p_sys->p_worker_stats || !p_sys->p_worker_args || !p_sys->worker_threads)
         goto error;
 
+    /* Frame-complete signal between whichever worker sees a field/frame's
+       last packet and the sender thread (see SignalFrameComplete()). */
+    vlc_mutex_init(&p_sys->frame_lock);
+    p_sys->b_frame_lock_inited = true;
+    vlc_cond_init(&p_sys->frame_cond);
+    p_sys->b_frame_cond_inited = true;
+
     if (vlc_clone(&p_sys->receive_thread, ReceiveThread, p_demux, VLC_THREAD_PRIORITY_INPUT)) {
         msg_Err(p_demux, "st2110: failed to spawn receive thread");
         goto error;
@@ -1432,6 +1484,11 @@ static void Close(vlc_object_t *obj)
     free(p_sys->worker_threads);
     free(p_sys->p_worker_args);
     free(p_sys->p_worker_stats);
+
+    if (p_sys->b_frame_cond_inited)
+        vlc_cond_destroy(&p_sys->frame_cond);
+    if (p_sys->b_frame_lock_inited)
+        vlc_mutex_destroy(&p_sys->frame_lock);
 
 #ifdef _WIN32
     if (p_sys->queue_sem)
