@@ -404,6 +404,25 @@ struct demux_sys_t
        ~5s, alongside its other stats. */
     atomic_uint  i_frame_signals;
 
+    /* Completion barrier for the marker-bit signal above: with N worker
+       threads all popping from one FIFO queue but finishing in whatever
+       order they finish (not necessarily the order they popped in),
+       "the worker that processed the marker packet is done" does NOT by
+       itself mean every earlier-queued packet has also finished being
+       written -- a slower worker could still be mid-write on one. That
+       gap caused visible block-corruption, not just tearing, when first
+       tried without this. n_in_flight counts packets that have been
+       popped but not yet fully processed (see QueuePop()/WorkerThread());
+       marker_pending is set when a worker sees the completing marker.
+       Whichever worker's decrement is the one that brings n_in_flight to
+       zero -- i.e. genuinely the last packet queued up to that point to
+       finish, regardless of which thread it happened to run on --
+       atomically claims marker_pending and fires the signal. This keeps
+       full N-way parallelism in the unpack stage (needed for weaker
+       hardware than this dev machine) while still being race-free. */
+    atomic_uint  n_in_flight;
+    atomic_bool  marker_pending;
+
     /* Cooperative shutdown signal: a blocked WaitForMultipleObjects()/
        poll()/vlc_cond_timedwait() is not guaranteed to be interrupted by
        vlc_cancel() on every platform, so every wait loop here also checks
@@ -739,9 +758,14 @@ static void ProcessPacket(demux_sys_t *p_sys, worker_stats_t *stats,
     /* For interlace, only field two's marker completes a full woven
        frame -- field one's marker just means "half done, field two still
        to come". hdrs[0] stands in for the whole packet's field since a
-       single packet's chained SRD headers are always for one field. */
+       single packet's chained SRD headers are always for one field.
+       This only marks the intent to signal; WorkerThread() is what
+       actually fires it, once every packet queued up to this point has
+       genuinely finished being written (see the n_in_flight/
+       marker_pending comment on demux_sys_t for why that distinction
+       matters with N parallel workers). */
     if (marker && (!p_sys->b_interlace || hdrs[0].field2))
-        SignalFrameComplete(p_sys);
+        atomic_store(&p_sys->marker_pending, true);
 }
 
 /* Pushes a raw, not-yet-parsed datagram into the shared staging queue.
@@ -1147,9 +1171,24 @@ static void *WorkerThread(void *data)
         size_t len;
         if (!QueuePop(p_sys, pkt, &len))
             break;
+        atomic_fetch_add(&p_sys->n_in_flight, 1);
 
         int canc = vlc_savecancel();
         ProcessPacket(p_sys, stats, pkt, len);
+
+        /* atomic_fetch_sub() returns the pre-decrement value, so == 1
+           means this decrement is the one that brought the count to
+           zero -- i.e. every packet popped up to and including this
+           moment has now genuinely finished being written, regardless
+           of which worker thread did the writing. Only then is it safe
+           to check/claim marker_pending (see the demux_sys_t comment for
+           why the two need to be checked together, not independently). */
+        if (atomic_fetch_sub(&p_sys->n_in_flight, 1) == 1) {
+            bool expected = true;
+            if (atomic_compare_exchange_strong(&p_sys->marker_pending, &expected, false))
+                SignalFrameComplete(p_sys);
+        }
+
         vlc_restorecancel(canc);
     }
 
