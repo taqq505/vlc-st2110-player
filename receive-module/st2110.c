@@ -1164,10 +1164,11 @@ static void *WorkerThread(void *data)
  * visible horizontal-tearing artifact, did) grab a frame that was half
  * this field and half the previous one. Waiting for the real field/frame
  * boundary instead eliminates that at the source. The wait is still
- * bounded (2 frame intervals) as a fallback for a stalled/lost stream,
- * so a missed marker can't wedge this thread -- packet loss still just
- * means some pixels are one tick stale, never a discarded or blanked
- * frame. Also owns the periodic (~5s) diagnostic log. */
+ * bounded (one frame interval -- see the note below on why not more) as
+ * a fallback for a missed marker or a stalled/lost stream, so this
+ * thread can't wedge; packet loss still just means some pixels are one
+ * tick stale, never a discarded or blanked frame. Also owns the periodic
+ * (~5s) diagnostic log. */
 static void *SenderThread(void *data)
 {
     demux_t *p_demux = data;
@@ -1181,8 +1182,15 @@ static void *SenderThread(void *data)
 
         vlc_mutex_lock(&p_sys->frame_lock);
         if (!p_sys->b_frame_ready)
+            /* Real-world senders don't all set the RTP marker bit on
+               every single frame (confirmed via the frame_signals log
+               below landing at ~75-80% of the expected count, not 0% or
+               100%) -- so this fallback isn't a rare safety net, it's a
+               regular occurrence. Bounding it to exactly one frame
+               interval, not more, matters: anything longer adds that
+               much extra latency on every frame the marker misses. */
             vlc_cond_timedwait(&p_sys->frame_cond, &p_sys->frame_lock,
-                                mdate() + frame_interval * 2);
+                                mdate() + frame_interval);
         p_sys->b_frame_ready = false;
         vlc_mutex_unlock(&p_sys->frame_lock);
 
