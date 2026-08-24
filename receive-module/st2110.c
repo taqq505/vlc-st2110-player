@@ -327,19 +327,26 @@ struct demux_sys_t
     es_out_id_t *p_es;
     date_t       pts;
 
-    /* Persistent picture buffer: allocated and zeroed once, then NEVER
-       cleared again. Every worker thread writes incoming pixels directly
-       into it at the position its own packet describes; the sender
-       thread periodically copies whatever is currently in it out to
-       es_out. No lock is needed for the writes: RFC4175 guarantees two
-       different packets never target overlapping byte ranges (see the
-       file header comment), so concurrent writers never race with each
-       other. The sender's snapshot copy can in principle race with an
-       in-progress write (a rare, cosmetically-torn line at worst) --
-       an accepted trade-off for a monitoring tool that would rather show
-       slightly-torn video than add synchronization back into the hot
-       path. */
-    uint8_t *p_master_buf;
+    /* Double-buffered picture buffer: two full frame buffers, each
+       allocated and zeroed once and never cleared again. Workers always
+       write into whichever one active_write_idx currently names; the
+       worker whose decrement brings n_in_flight to zero (see
+       marker_pending above) flips active_write_idx to the other buffer
+       in the same breath as recording which one just became
+       completed_buf_idx, before signaling the sender. From that instant
+       no worker will ever write into completed_buf_idx again until a
+       full frame period later, so the sender can copy it out at its own
+       pace with no possibility of reading a buffer that's concurrently
+       being written -- unlike a single shared buffer, where the sender's
+       copy could in principle still land mid-write for whatever the
+       *next* frame's earliest packets touch first. Within one buffer,
+       no lock is needed for the writes themselves: RFC4175 guarantees
+       two different packets never target overlapping byte ranges (see
+       the file header comment), so concurrent writers into the same
+       buffer never race with each other either. */
+    uint8_t     *p_master_buf[2];
+    atomic_uint  active_write_idx;   /* which buffer workers write into */
+    atomic_uint  completed_buf_idx;  /* which buffer the sender should read */
     size_t   i_buf_size;
     size_t   i_y_plane_size;
     size_t   i_uv_plane_size;
@@ -629,19 +636,21 @@ static bool MapLine(const demux_sys_t *p_sys, const rfc4175_line_hdr_t *h,
 }
 
 /* Unpacks RFC4175 YCbCr-4:2:2 10bit GPM pgroups (5 bytes -> Cb,Y0,Cr,Y1)
- * directly into the persistent master buffer's Y/U/V planes. Called by
+ * directly into buf_idx's Y/U/V planes (see the demux_sys_t comment on
+ * p_master_buf for why the caller picks the buffer once up front rather
+ * than this function re-reading active_write_idx itself). Called by
  * whichever worker thread dequeued this packet -- no lock: this packet's
  * target byte ranges never overlap another packet's (different line, or a
  * non-overlapping segment of the same line), so concurrent calls from
- * different worker threads are safe. */
-static void WriteLines(demux_sys_t *p_sys, worker_stats_t *stats,
+ * different worker threads writing into the same buffer are safe. */
+static void WriteLines(demux_sys_t *p_sys, worker_stats_t *stats, unsigned buf_idx,
                         const rfc4175_line_hdr_t *hdrs, unsigned n_hdrs,
                         const uint8_t *data, size_t data_len)
 {
     size_t off = 0;
     unsigned half_w = p_sys->i_width / 2;
 
-    uint8_t *buf = p_sys->p_master_buf;
+    uint8_t *buf = p_sys->p_master_buf[buf_idx];
     uint16_t *y_plane = (uint16_t *)buf;
     uint16_t *u_plane = (uint16_t *)(buf + p_sys->i_y_plane_size);
     uint16_t *v_plane = (uint16_t *)(buf + p_sys->i_y_plane_size
@@ -753,7 +762,8 @@ static void ProcessPacket(demux_sys_t *p_sys, worker_stats_t *stats,
     }
 
     DetectLineMode(p_sys, hdrs, n_hdrs);
-    WriteLines(p_sys, stats, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
+    unsigned buf_idx = atomic_load(&p_sys->active_write_idx);
+    WriteLines(p_sys, stats, buf_idx, hdrs, n_hdrs, payload + hdr_bytes, payload_len - hdr_bytes);
 
     /* For interlace, only field two's marker completes a full woven
        frame -- field one's marker just means "half done, field two still
@@ -1185,8 +1195,18 @@ static void *WorkerThread(void *data)
            why the two need to be checked together, not independently). */
         if (atomic_fetch_sub(&p_sys->n_in_flight, 1) == 1) {
             bool expected = true;
-            if (atomic_compare_exchange_strong(&p_sys->marker_pending, &expected, false))
+            if (atomic_compare_exchange_strong(&p_sys->marker_pending, &expected, false)) {
+                /* Flip which buffer workers write into *before* telling
+                   the sender which one just became safe to read (see the
+                   demux_sys_t comment on p_master_buf). n_in_flight is
+                   genuinely zero right now -- no other worker is mid-
+                   write -- so nothing can still be writing into the
+                   buffer we're about to hand off. */
+                unsigned old_idx = atomic_load(&p_sys->active_write_idx);
+                atomic_store(&p_sys->completed_buf_idx, old_idx);
+                atomic_store(&p_sys->active_write_idx, old_idx ^ 1);
                 SignalFrameComplete(p_sys);
+            }
         }
 
         vlc_restorecancel(canc);
@@ -1238,7 +1258,8 @@ static void *SenderThread(void *data)
 
         block_t *p_block = block_Alloc(p_sys->i_buf_size);
         if (p_block) {
-            memcpy(p_block->p_buffer, p_sys->p_master_buf, p_sys->i_buf_size);
+            unsigned buf_idx = atomic_load(&p_sys->completed_buf_idx);
+            memcpy(p_block->p_buffer, p_sys->p_master_buf[buf_idx], p_sys->i_buf_size);
             p_block->i_dts = p_block->i_pts = date_Get(&p_sys->pts);
             /* WriteLines() already weaves both fields into one frame (see
                MapLine()), but without this flag VLC's own deinterlace
@@ -1409,8 +1430,9 @@ static int Open(vlc_object_t *obj)
     p_sys->i_y_plane_size  = (size_t)p_sys->i_width * p_sys->i_height * 2;
     p_sys->i_uv_plane_size = (size_t)(p_sys->i_width / 2) * p_sys->i_height * 2;
     p_sys->i_buf_size = p_sys->i_y_plane_size + 2 * p_sys->i_uv_plane_size;
-    p_sys->p_master_buf = calloc(1, p_sys->i_buf_size);
-    if (!p_sys->p_master_buf)
+    p_sys->p_master_buf[0] = calloc(1, p_sys->i_buf_size);
+    p_sys->p_master_buf[1] = calloc(1, p_sys->i_buf_size);
+    if (!p_sys->p_master_buf[0] || !p_sys->p_master_buf[1])
         goto error;
 
     es_format_t fmt;
@@ -1568,7 +1590,8 @@ static void Close(vlc_object_t *obj)
         net_Close(p_sys->fd);
 
     free(p_sys->psz_source);
-    free(p_sys->p_master_buf);
+    free(p_sys->p_master_buf[0]);
+    free(p_sys->p_master_buf[1]);
     free(p_sys);
     p_demux->p_sys = NULL;
 }
