@@ -909,6 +909,17 @@ static void *ReceiveThread(void *data)
     demux_sys_t *p_sys = p_demux->p_sys;
     RIORESULT results[RIO_MAX_RESULTS];
 
+    /* Spin guard: if RIONotify()+WaitForSingleObject() ever reports the
+       event signaled with genuinely nothing to dequeue, several times in
+       a row, something is wrong with the notify/reset handshake (e.g. a
+       spurious re-signal) and this loop would otherwise spin at 100% CPU
+       calling nothing but Win32 APIs -- exactly the kind of runaway that
+       destabilized a whole test machine (including its RDP session) once
+       already. This forces a real sleep once that pattern is detected,
+       trading a little latency for never being able to peg a core doing
+       nothing. */
+    unsigned n_consecutive_empty = 0;
+
     for (;;) {
         if (atomic_load(&p_sys->b_stop_requested))
             break;
@@ -923,10 +934,12 @@ static void *ReceiveThread(void *data)
 
         int canc = vlc_savecancel();
 
+        ULONG n_total = 0;
         for (;;) {
             ULONG n = p_sys->rio.RIODequeueCompletion(p_sys->rio_cq, results, RIO_MAX_RESULTS);
             if (n == 0 || n == RIO_CORRUPT_CQ)
                 break;
+            n_total += n;
 
             for (ULONG i = 0; i < n; i++) {
                 ULONG slot = (ULONG)(uintptr_t)results[i].RequestContext;
@@ -951,6 +964,17 @@ static void *ReceiveThread(void *data)
         }
 
         vlc_restorecancel(canc);
+
+        if (n_total == 0) {
+            if (++n_consecutive_empty >= 64) {
+                if (n_consecutive_empty == 64)
+                    msg_Warn(p_demux, "st2110: receive thread woke with nothing to "
+                             "dequeue 64 times in a row -- throttling to avoid a busy spin");
+                Sleep(5);
+            }
+        } else {
+            n_consecutive_empty = 0;
+        }
     }
 
     return NULL;
